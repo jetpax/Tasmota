@@ -51,6 +51,7 @@ be_extern_native_module(wsserver);
 be_extern_native_module(webfiles);
 #endif // USE_BERRY_WEBFILES
 #endif // USE_BERRY_HTTPSERVER
+be_extern_native_module(modem);
 be_extern_native_module(flash);
 be_extern_native_module(path);
 be_extern_native_module(unishox);
@@ -190,6 +191,7 @@ BERRY_LOCAL const bntvmodule_t* const be_module_table[] = {
     &be_native_module(webfiles),
 #endif // USE_BERRY_WEBFILES
 #endif // USE_BERRY_HTTPSERVER
+    &be_native_module(modem),
 #ifdef USE_ZIGBEE
     &be_native_module(zigbee),
     &be_native_module(matter_zigbee),
