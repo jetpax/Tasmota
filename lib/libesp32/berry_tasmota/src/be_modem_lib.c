@@ -61,6 +61,80 @@ static int8_t g_modem_reset_pin = -1;
 static esp_modem_dce_t *g_modem_dce = NULL;
 static esp_netif_t *g_modem_netif = NULL;
 
+// Modem type - used to customize AT commands for different modems
+typedef enum {
+    MODEM_TYPE_GENERIC = 0,
+    MODEM_TYPE_SIM7600,
+    MODEM_TYPE_SIM800,
+    MODEM_TYPE_BG96
+} modem_type_t;
+
+static modem_type_t g_modem_type = MODEM_TYPE_SIM7600; // Default to SIM7600
+
+// Get AT command for getting GNSS data based on modem type
+static const char* get_gnss_command(void) {
+    switch (g_modem_type) {
+        case MODEM_TYPE_SIM7600:
+            return "AT+CGNSINF\r"; // SIM7600 uses this command
+        case MODEM_TYPE_BG96:
+            return "AT+QGPSLOC=2\r"; // BG96 uses this command format
+        case MODEM_TYPE_SIM800:
+            return "AT+CGPSINF=0\r"; // SIM800 uses this command
+        case MODEM_TYPE_GENERIC:
+        default:
+            return "AT+CGNSINF\r"; // Default to SIM7600 format
+    }
+}
+
+// Store the GNSS response for parsing
+static char *gnss_response = NULL;
+static bool gnss_info_received = false;
+
+// GNSS info line handler callback
+static esp_err_t gnss_info_line_handler(uint8_t *data, size_t len) {
+    if (data == NULL || len == 0) {
+        return ESP_FAIL;
+    }
+    
+    char *line = (char *)data;
+    
+    // Different modems have different response prefixes
+    const char* sim7600_prefix = "+CGNSINF: ";
+    const char* bg96_prefix = "+QGPSLOC: ";
+    const char* sim800_prefix = "+CGPSINF: ";
+    
+    // Check for the appropriate prefix based on modem type
+    const char* prefix = NULL;
+    switch (g_modem_type) {
+        case MODEM_TYPE_SIM7600:
+            prefix = sim7600_prefix;
+            break;
+        case MODEM_TYPE_BG96:
+            prefix = bg96_prefix;
+            break;
+        case MODEM_TYPE_SIM800:
+            prefix = sim800_prefix;
+            break;
+        case MODEM_TYPE_GENERIC:
+        default:
+            prefix = sim7600_prefix; // Default to SIM7600 format
+            break;
+    }
+    
+    // Look for the GNSS info response
+    if (strncmp(line, prefix, strlen(prefix)) == 0) {
+        // Make a copy of the response for parsing
+        if (gnss_response != NULL) {
+            free(gnss_response);
+        }
+        gnss_response = strdup(line);
+        gnss_info_received = true;
+        return ESP_OK;
+    }
+    
+    return ESP_OK;
+}
+
 // Function declarations for Berry VM
 static int w_modem_init(bvm *vm);
 static int w_modem_init_usb(bvm *vm);
@@ -73,9 +147,14 @@ static int w_modem_set_power_pin(bvm *vm);
 static int w_modem_set_reset_pin(bvm *vm);
 static int w_modem_reset(bvm *vm);
 static int w_modem_get_gnss_info(bvm *vm);
+static int w_modem_set_type(bvm *vm);
+static int w_modem_get_type(bvm *vm);
 
 // Need to export these symbols for Berry VM
 BE_EXPORT_VARIABLE extern const bclass be_class_modem;
+
+// External function from be_modem_factory_bridge.cpp
+extern esp_err_t modem_bridge_set_module_type(esp_modem_dce_t *dce, const char *module_type);
 
 // Function to configure modem power pin
 static int w_modem_set_power_pin(bvm *vm) {
@@ -205,61 +284,39 @@ static int w_modem_reset(bvm *vm) {
     be_return(vm);
 }
 
-// Buffer to store the relevant part of +CGNSINF response
-static char gnss_info_buffer[200];
-static bool gnss_info_received = false;
-
-// Callback for esp_modem_command to handle response lines
-static esp_err_t gnss_info_line_handler(uint8_t *data, size_t len) {
-    const char* prefix = "+CGNSINF: ";
-    size_t prefix_len = strlen(prefix);
-    // Check if the line starts with the prefix and we haven't received it yet
-    if (len > prefix_len && strncmp((const char*)data, prefix, prefix_len) == 0) {
-        // Copy the data part after the prefix
-        size_t data_len = len - prefix_len;
-        if (data_len < sizeof(gnss_info_buffer)) {
-            memcpy(gnss_info_buffer, data + prefix_len, data_len);
-            gnss_info_buffer[data_len] = '\0';
-            gnss_info_received = true;
-            // Potentially return ESP_FAIL to stop processing further lines, 
-            // but ESP_OK might be safer if other info follows
-            // return ESP_FAIL; 
-        } else {
-            ESP_LOGE("modem.gnss", "GNSS info buffer too small");
-            gnss_info_buffer[0] = '\0';
-            gnss_info_received = false; 
-        }
-    }
-    return ESP_OK; // Continue processing lines
-}
-
-// Berry function: modem.gnss()
+// Get GNSS information from the modem
 static int w_modem_get_gnss_info(bvm *vm) {
     int top = be_top(vm);
-
-    if (!g_modem_dce) {
+    
+    if (g_modem_dce == NULL) {
         be_raise(vm, "runtime_error", "Modem not initialized");
         be_return(vm);
     }
 
-    // Reset buffer and flag before sending command
-    gnss_info_buffer[0] = '\0';
+    // Free any previous response
+    if (gnss_response != NULL) {
+        free(gnss_response);
+        gnss_response = NULL;
+    }
+    
+    // Reset the flag
     gnss_info_received = false;
 
-    // Send AT+CGNSINF command
-    esp_err_t err = esp_modem_command(g_modem_dce, "AT+CGNSINF\r", gnss_info_line_handler, 2000);
+    // Send AT command for GNSS info based on modem type
+    esp_err_t err = esp_modem_command(g_modem_dce, get_gnss_command(), gnss_info_line_handler, 2000);
 
     if (err != ESP_OK) {
-        be_raise(vm, "runtime_error", "Failed to execute AT+CGNSINF");
+        be_raise(vm, "runtime_error", "Failed to execute GNSS command");
+        be_return(vm);
+    }
+    
+    // Check if we got a response
+    if (!gnss_info_received || gnss_response == NULL) {
+        be_raise(vm, "runtime_error", "No GNSS data received");
         be_return(vm);
     }
 
-    if (!gnss_info_received) {
-        be_raise(vm, "runtime_error", "No +CGNSINF response received");
-        be_return(vm);
-    }
-
-    // Parse the gnss_info_buffer
+    // Parse the gnss_response
     // +CGNSINF: <run_status>,<fix_status>,<UTC>,<lat>,<lon>,<alt>,<speed_knots>,<course>,<fix_mode>,<res1>,<hdop>,<pdop>,<vdop>,<res2>,<sats_in_view>,<sats_used>,<glonass_sats_in_view>,<res3>,<cn0_max>,<hpa>,<vpa>
     int run_status = 0, fix_status = 0, fix_mode = 0, sats_in_view = 0, sats_used = 0, cn0_max = 0;
     char utc_datetime[20] = {0};
@@ -269,7 +326,7 @@ static int w_modem_get_gnss_info(bvm *vm) {
     char dummy1[10], dummy2[10], dummy3[10], dummy4[10];
 
     // Be careful with sscanf, it can be tricky. Check the number of fields assigned.
-    int fields = sscanf(gnss_info_buffer, 
+    int fields = sscanf(gnss_response, 
                         "%d,%d,%18[^,],%lf,%lf,%lf,%lf,%lf,%d,%[^,],%lf,%lf,%lf,%[^,],%d,%d,%[^,],%[^,],%d,%lf,%lf",
                         &run_status, &fix_status, utc_datetime,
                         &latitude, &longitude, &altitude,
@@ -279,7 +336,7 @@ static int w_modem_get_gnss_info(bvm *vm) {
                         &cn0_max, &hpa, &vpa);
 
     if (fields < 17) { // Check if we parsed at least up to sats_used (adjust count as needed)
-        ESP_LOGE("modem.gnss", "Failed to parse +CGNSINF: %s (fields=%d)", gnss_info_buffer, fields);
+        ESP_LOGE("modem.gnss", "Failed to parse GNSS info: %s (fields=%d)", gnss_response, fields);
         be_raise(vm, "value_error", "Failed to parse GNSS info");
         be_return(vm);
     }
@@ -577,14 +634,21 @@ static int w_modem_status(bvm *vm) {
 
     // Operator Name
     char operator_name[32] = {0};
-    err = esp_modem_get_operator_name(g_modem_dce, operator_name, sizeof(operator_name));
+    int act = -1; // Access technology (required by API)
+    err = esp_modem_get_operator_name(g_modem_dce, operator_name, &act);
     if (err == ESP_OK) {
         be_pushstring(vm, operator_name);
         be_setmember(vm, -2, "operator");
+        
+        be_pushint(vm, act);
+        be_setmember(vm, -2, "operator_act");
     } else {
         ESP_LOGW(TAG, "Failed to get operator name: %s", esp_err_to_name(err));
         be_pushstring(vm, ""); // Push empty string on error
         be_setmember(vm, -2, "operator");
+        
+        be_pushint(vm, -1);
+        be_setmember(vm, -2, "operator_act");
     }
 
     // Battery Status
@@ -653,6 +717,69 @@ static int w_modem_status(bvm *vm) {
     be_return(vm);
 }
 
+// Set the modem module type (runtime configuration)
+static int w_modem_set_type(bvm *vm) {
+    int top = be_top(vm);
+    
+    if (!be_isstring(vm, 1)) {
+        be_raise(vm, "type_error", "Expected string modem type");
+        be_return(vm);
+    }
+    
+    const char *module_type = be_tostring(vm, 1);
+    ESP_LOGI(TAG, "Setting modem type to %s", module_type);
+    
+    // Convert string to modem type enum
+    if (strcasecmp(module_type, "SIM7600") == 0) {
+        g_modem_type = MODEM_TYPE_SIM7600;
+        ESP_LOGI(TAG, "Modem type set to SIM7600");
+    } 
+    else if (strcasecmp(module_type, "SIM800") == 0) {
+        g_modem_type = MODEM_TYPE_SIM800;
+        ESP_LOGI(TAG, "Modem type set to SIM800");
+    }
+    else if (strcasecmp(module_type, "BG96") == 0) {
+        g_modem_type = MODEM_TYPE_BG96;
+        ESP_LOGI(TAG, "Modem type set to BG96");
+    }
+    else if (strcasecmp(module_type, "GENERIC") == 0) {
+        g_modem_type = MODEM_TYPE_GENERIC;
+        ESP_LOGI(TAG, "Modem type set to GENERIC");
+    }
+    else {
+        be_raise(vm, "value_error", "Unknown modem type");
+        be_return(vm);
+    }
+    
+    be_pushbool(vm, true);
+    be_return(vm);
+}
+
+// Get modem type as string
+static int w_modem_get_type(bvm *vm) {
+    int top = be_top(vm);
+    
+    const char* type_str = "UNKNOWN";
+    
+    switch (g_modem_type) {
+        case MODEM_TYPE_SIM7600:
+            type_str = "SIM7600";
+            break;
+        case MODEM_TYPE_SIM800:
+            type_str = "SIM800";
+            break;
+        case MODEM_TYPE_BG96:
+            type_str = "BG96";
+            break;
+        case MODEM_TYPE_GENERIC:
+            type_str = "GENERIC";
+            break;
+    }
+    
+    be_pushstring(vm, type_str);
+    be_return(vm);
+}
+
 /* @const_object_info_begin
 module modem (scope: global, strings: weak) {
     init, func(w_modem_init)
@@ -665,7 +792,9 @@ module modem (scope: global, strings: weak) {
     power_on, func(w_modem_power_on)
     power_off, func(w_modem_power_off)
     reset, func(w_modem_reset)
-    get_gnss_info, func(w_modem_get_gnss_info)
+    gnss, func(w_modem_get_gnss_info)
+    set_type, func(w_modem_set_type)
+    get_type, func(w_modem_get_type)
 }
 @const_object_info_end */
 
