@@ -90,6 +90,10 @@ static const char* get_gnss_command(void) {
 static char *gnss_response = NULL;
 static bool gnss_info_received = false;
 
+// Berry function callbacks for connection events
+static void *be_modem_connect_cb = NULL;       // On connect callback
+static void *be_modem_disconnect_cb = NULL;    // On disconnect callback
+
 // GNSS info line handler callback
 static esp_err_t gnss_info_line_handler(uint8_t *data, size_t len) {
     if (data == NULL || len == 0) {
@@ -151,6 +155,8 @@ static int w_modem_set_type(bvm *vm);
 static int w_modem_get_type(bvm *vm);
 static int w_modem_get_msisdn(bvm *vm);
 static int w_modem_send_sms(bvm *vm);
+static int w_modem_on_connect(bvm *vm);
+static int w_modem_on_disconnect(bvm *vm);
 
 // Need to export these symbols for Berry VM
 BE_EXPORT_VARIABLE extern const bclass be_class_modem;
@@ -506,15 +512,15 @@ static int w_modem_init_usb(bvm *vm) {
     be_return(vm);
 }
 
-// Connect to the modem
+// Connect to the cellular network
 static int w_modem_connect(bvm *vm) {
     int top = be_top(vm);
-    
-    if (g_modem_dce == NULL) {
+
+    if (!g_modem_dce) {
         be_raise(vm, "value_error", "Modem not initialized");
         be_return(vm);
     }
-    
+
     // Extract parameters if provided (APN, username, password)
     const char *apn = "internet";  // Default APN
     const char *username = "";     // Default empty username
@@ -548,15 +554,26 @@ static int w_modem_connect(bvm *vm) {
         be_return(vm);
     }
     
+    // Invoke the connect callback if registered
+    if (be_modem_connect_cb != NULL) {
+        be_getglobal(vm, "_modem_connect_cb");
+        if (!be_isnil(vm, -1)) {
+            be_pushbool(vm, true); // Connection success
+            be_pcall(vm, 1);
+            be_pop(vm, 1); // Remove result from the stack
+        }
+        be_pop(vm, 1); // Remove function from the stack
+    }
+    
     be_pushbool(vm, true);
     be_return(vm);
 }
 
-// Disconnect from the modem
+// Disconnect from the cellular network
 static int w_modem_disconnect(bvm *vm) {
     int top = be_top(vm);
     
-    if (g_modem_dce == NULL) {
+    if (!g_modem_dce) {
         be_raise(vm, "value_error", "Modem not initialized");
         be_return(vm);
     }
@@ -569,6 +586,17 @@ static int w_modem_disconnect(bvm *vm) {
         ESP_LOGE(TAG, "Failed to switch to command mode: %s", esp_err_to_name(err));
         be_raise(vm, "value_error", "Failed to stop PPP");
         be_return(vm);
+    }
+    
+    // Invoke the disconnect callback if registered
+    if (be_modem_disconnect_cb != NULL) {
+        be_getglobal(vm, "_modem_disconnect_cb");
+        if (!be_isnil(vm, -1)) {
+            be_pushbool(vm, true); // Disconnection success
+            be_pcall(vm, 1);
+            be_pop(vm, 1); // Remove result from the stack
+        }
+        be_pop(vm, 1); // Remove function from the stack
     }
     
     be_pushbool(vm, true);
@@ -950,6 +978,42 @@ static int w_modem_get_msisdn(bvm *vm) {
     be_return(vm);
 }
 
+// Register a function to be called when modem connects
+static int w_modem_on_connect(bvm *vm) {
+    int top = be_top(vm);
+    
+    if (top >= 1 && (be_isfunction(vm, 1) || be_isclosure(vm, 1))) {
+        // Store the callback in the global '_modem_connect_cb'
+        be_pushvalue(vm, 1);
+        be_setglobal(vm, "_modem_connect_cb");
+        be_modem_connect_cb = (void*)1;  // Just mark that callback is registered (non-NULL)
+        be_pushbool(vm, true);
+    } else {
+        be_raise(vm, "type_error", "callback required");
+        be_return(vm);
+    }
+    
+    be_return(vm);
+}
+
+// Register a function to be called when modem disconnects
+static int w_modem_on_disconnect(bvm *vm) {
+    int top = be_top(vm);
+    
+    if (top >= 1 && (be_isfunction(vm, 1) || be_isclosure(vm, 1))) {
+        // Store the callback in the global '_modem_disconnect_cb'
+        be_pushvalue(vm, 1);
+        be_setglobal(vm, "_modem_disconnect_cb");
+        be_modem_disconnect_cb = (void*)1;  // Just mark that callback is registered (non-NULL)
+        be_pushbool(vm, true);
+    } else {
+        be_raise(vm, "type_error", "callback required");
+        be_return(vm);
+    }
+    
+    be_return(vm);
+}
+
 /* @const_object_info_begin
 module modem (scope: global, strings: weak) {
     init, func(w_modem_init)
@@ -967,6 +1031,8 @@ module modem (scope: global, strings: weak) {
     get_type, func(w_modem_get_type)
     msisdn, func(w_modem_get_msisdn)
     send_sms, func(w_modem_send_sms)
+    on_connect, func(w_modem_on_connect)
+    on_disconnect, func(w_modem_on_disconnect)
 }
 @const_object_info_end */
 
