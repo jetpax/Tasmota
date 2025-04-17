@@ -149,6 +149,8 @@ static int w_modem_reset(bvm *vm);
 static int w_modem_get_gnss_info(bvm *vm);
 static int w_modem_set_type(bvm *vm);
 static int w_modem_get_type(bvm *vm);
+static int w_modem_get_msisdn(bvm *vm);
+static int w_modem_send_sms(bvm *vm);
 
 // Need to export these symbols for Berry VM
 BE_EXPORT_VARIABLE extern const bclass be_class_modem;
@@ -780,6 +782,174 @@ static int w_modem_get_type(bvm *vm) {
     be_return(vm);
 }
 
+// Track the SMS send status
+static bool sms_send_success = false;
+
+// Callback for the SMS text mode command
+static esp_err_t sms_mode_handler(uint8_t *data, size_t len) {
+    // Just looking for "OK" response, which is handled by default
+    return ESP_OK;
+}
+
+// Callback for SMS send command - looking for ">" prompt
+static esp_err_t sms_send_handler(uint8_t *data, size_t len) {
+    // Looking for ">" prompt that indicates the modem is ready for the message
+    if (len == 1 && data[0] == '>') {
+        return ESP_FAIL; // Return ESP_FAIL to stop further line processing
+    }
+    return ESP_OK;
+}
+
+// Callback for SMS send content - checking for final response
+static esp_err_t sms_content_handler(uint8_t *data, size_t len) {
+    // Response will look like:
+    // +CMGS: <mr>
+    // OK
+    const char* prefix = "+CMGS: ";
+    size_t prefix_len = strlen(prefix);
+    
+    if (len > prefix_len && strncmp((const char*)data, prefix, prefix_len) == 0) {
+        sms_send_success = true;
+    }
+    return ESP_OK;
+}
+
+// Send an SMS message
+static int w_modem_send_sms(bvm *vm) {
+    int top = be_top(vm);
+    
+    if (g_modem_dce == NULL) {
+        be_raise(vm, "runtime_error", "Modem not initialized");
+        be_return(vm);
+    }
+    
+    if (!be_isstring(vm, 1) || !be_isstring(vm, 2)) {
+        be_raise(vm, "type_error", "Expected string phone number and message");
+        be_return(vm);
+    }
+    
+    // Get phone number and message from arguments
+    const char *phone_number = be_tostring(vm, 1);
+    const char *message = be_tostring(vm, 2);
+    
+    // Step 1: Set SMS text mode
+    esp_err_t err = esp_modem_command(g_modem_dce, "AT+CMGF=1\r", sms_mode_handler, 1000);
+    if (err != ESP_OK) {
+        be_raise(vm, "runtime_error", "Failed to set SMS text mode");
+        be_return(vm);
+    }
+    
+    // Step 2: Start SMS send command with phone number
+    char send_cmd[64];
+    snprintf(send_cmd, sizeof(send_cmd), "AT+CMGS=\"%s\"\r", phone_number);
+    err = esp_modem_command(g_modem_dce, send_cmd, sms_send_handler, 5000);
+    if (err != ESP_OK) {
+        be_raise(vm, "runtime_error", "Failed to initiate SMS send");
+        be_return(vm);
+    }
+    
+    // Step 3: Send the message content followed by Ctrl+Z
+    char *content_cmd;
+    size_t content_len = strlen(message);
+    // Allocate buffer for message + Ctrl+Z + terminating null
+    content_cmd = malloc(content_len + 2);
+    if (!content_cmd) {
+        be_raise(vm, "memory_error", "Failed to allocate memory for SMS content");
+        be_return(vm);
+    }
+    
+    // Copy message and append Ctrl+Z
+    strcpy(content_cmd, message);
+    content_cmd[content_len] = 26; // Ctrl+Z
+    content_cmd[content_len + 1] = '\0';
+    
+    // Reset success flag
+    sms_send_success = false;
+    
+    // Send the content
+    err = esp_modem_command(g_modem_dce, content_cmd, sms_content_handler, 10000);
+    free(content_cmd); // Free allocated memory
+    
+    if (err != ESP_OK) {
+        be_raise(vm, "runtime_error", "Failed to send SMS content");
+        be_return(vm);
+    }
+    
+    // Return success status
+    be_pushbool(vm, sms_send_success);
+    be_return(vm);
+}
+
+// Buffer to store CNUM response
+static char msisdn_buffer[32] = {0};
+static bool msisdn_received = false;
+
+// Callback for CNUM command
+static esp_err_t msisdn_line_handler(uint8_t *data, size_t len) {
+    // The response format is +CNUM: "","<number>",<type>
+    // e.g. +CNUM: "","12345678901",145
+    const char* prefix = "+CNUM: ";
+    size_t prefix_len = strlen(prefix);
+    
+    if (len > prefix_len && strncmp((const char*)data, prefix, prefix_len) == 0) {
+        // Reset before parsing
+        msisdn_buffer[0] = '\0';
+        msisdn_received = false;
+        
+        // Extract the number part 
+        char* start = strchr((char*)data + prefix_len, ',');
+        if (start != NULL) {
+            start++; // Move past the comma
+            if (*start == '"') start++; // Move past quote if present
+            
+            char* end = strchr(start, ',');
+            if (end != NULL) {
+                if (*(end-1) == '"') end--; // Move before quote if present
+                
+                // Copy the number part
+                size_t number_len = end - start;
+                if (number_len < sizeof(msisdn_buffer)) {
+                    strncpy(msisdn_buffer, start, number_len);
+                    msisdn_buffer[number_len] = '\0';
+                    msisdn_received = true;
+                    ESP_LOGI(TAG, "MSISDN received: %s", msisdn_buffer);
+                }
+            }
+        }
+    }
+    return ESP_OK;
+}
+
+// Get the phone number (MSISDN) from the SIM card
+static int w_modem_get_msisdn(bvm *vm) {
+    int top = be_top(vm);
+    
+    if (g_modem_dce == NULL) {
+        be_raise(vm, "runtime_error", "Modem not initialized");
+        be_return(vm);
+    }
+    
+    // Reset before sending command
+    msisdn_buffer[0] = '\0';
+    msisdn_received = false;
+    
+    // Send AT+CNUM command to get the subscriber number
+    esp_err_t err = esp_modem_command(g_modem_dce, "AT+CNUM\r", msisdn_line_handler, 2000);
+    if (err != ESP_OK) {
+        be_raise(vm, "runtime_error", "Failed to execute AT+CNUM");
+        be_return(vm);
+    }
+    
+    if (!msisdn_received) {
+        // We didn't get a proper response, return empty string
+        be_pushstring(vm, "");
+    } else {
+        be_pushstring(vm, msisdn_buffer);
+    }
+    
+    be_return(vm);
+}
+
 /* @const_object_info_begin
 module modem (scope: global, strings: weak) {
     init, func(w_modem_init)
@@ -795,6 +965,8 @@ module modem (scope: global, strings: weak) {
     gnss, func(w_modem_get_gnss_info)
     set_type, func(w_modem_set_type)
     get_type, func(w_modem_get_type)
+    msisdn, func(w_modem_get_msisdn)
+    send_sms, func(w_modem_send_sms)
 }
 @const_object_info_end */
 
