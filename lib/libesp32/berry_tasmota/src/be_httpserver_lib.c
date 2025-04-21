@@ -62,7 +62,6 @@ typedef struct {
 } http_queue_msg_t;
 
 // Forward declarations for internal functions
-void be_httpserver_process_websocket_msg(bvm *vm, int client_id, const char *data, size_t len);
 bool httpserver_queue_message(http_msg_type_t type, int client_id, const void *data, size_t data_len, void *user_data);
 bool httpserver_queue_web_request(int handler_id, httpd_req_t *req, bvalue func);
 
@@ -118,22 +117,6 @@ static void http_connection_cleanup(void *arg) {
             http_server_disconn_handler(NULL, (int)(intptr_t)arg);
         }
     }
-}
-
-// WebSocket message processing function
-// CONTEXT: Main Tasmota Task (Berry VM Context)
-// This function runs in the main task when processing queued WebSocket messages
-void be_httpserver_process_websocket_msg(bvm *vm, int client_id, const char *data, size_t data_len) {
-    // Log message details safely (handling NULL data for connect events)
-    if (data) {
-        ESP_LOGD(TAG, "Processing WebSocket message in main task context: client=%d, data='%s', len=%d", 
-                 client_id, data, (int)data_len);
-    } else {
-        ESP_LOGD(TAG, "Processing WebSocket event in main task context: client=%d", client_id);
-    }
-    
-    // Forward to the WebSocket handler in be_wsserver_lib.c
-    be_wsserver_handle_message(vm, client_id, data, data_len);
 }
 
 // File request processing function
@@ -351,8 +334,52 @@ void be_httpserver_process_web_request(bvm *vm, http_queue_msg_t *msg) {
   // Push URI as argument
   be_pushstring(handler_vm, current_request->uri);
   
+  // Check if this is a POST request and handle POST data
+  int arg_count = 1;  // Start with 1 for the URI
+  
+  if (current_request->method == HTTP_POST) {
+      ESP_LOGI(TAG, "Processing POST request data");
+      
+      // Get content length
+      int content_len = current_request->content_len;
+      ESP_LOGI(TAG, "POST content length: %d", content_len);
+      
+      if (content_len > 0) {
+          // Allocate buffer for POST data
+          char *post_data = malloc(content_len + 1);
+          if (post_data) {
+              // Read POST data
+              int received = httpd_req_recv(current_request, post_data, content_len);
+              if (received > 0) {
+                  // Null-terminate the data
+                  post_data[received] = '\0';
+                  ESP_LOGI(TAG, "Received POST data: %s", post_data);
+                  
+                  // Push POST data as second argument
+                  be_pushstring(handler_vm, post_data);
+                  arg_count = 2;  // Now we have 2 arguments
+              } else {
+                  ESP_LOGW(TAG, "Failed to read POST data, received: %d", received);
+                  // Push nil as second argument
+                  be_pushnil(handler_vm);
+                  arg_count = 2;
+              }
+              free(post_data);
+          } else {
+              ESP_LOGE(TAG, "Failed to allocate memory for POST data");
+              // Push nil as second argument
+              be_pushnil(handler_vm);
+              arg_count = 2;
+          }
+      } else {
+          // No content, push empty string as second argument
+          be_pushstring(handler_vm, "");
+          arg_count = 2;
+      }
+  }
+  
   // Call the Berry function
-  int result = be_pcall(handler_vm, 1);
+  int result = be_pcall(handler_vm, arg_count);
   
   // Log stack state after call
   ESP_LOGI(TAG, "STACK: After be_pcall, stack top = %d, result = %d", be_top(handler_vm), result);
@@ -446,7 +473,7 @@ static int w_httpserver_process_queue(bvm *vm) {
                     } else {
                         ESP_LOGD(TAG, "QUEUE DATA: '' (connect/disconnect event)");
                     }
-                    be_httpserver_process_websocket_msg(vm, msg.client_id, msg.data, msg.data_len);
+                    be_wsserver_handle_message(vm, msg.client_id, msg.data, msg.data_len);
                     // Free the data buffer we allocated
                     if (msg.data) {
                         free(msg.data);
@@ -688,19 +715,36 @@ static int w_httpserver_start(bvm *vm) {
 // Register a URI handler
 static int w_httpserver_on(bvm *vm) {
     int top = be_top(vm);
+    httpd_method_t http_method = HTTP_GET; // Default method
     
     if (top < 2 || http_server == NULL) {
         be_raise(vm, "value_error", top < 2 ? "Missing arguments" : "Server not started");
-        return 0;
+        be_return(vm);
     }
     
     if (!be_isstring(vm, 1) || !be_isfunction(vm, 2)) {
         be_raise(vm, "type_error", "String and function required");
-        return 0;
+        be_return(vm);
+    }
+    
+    // Check for optional method argument
+    if (top >= 3) {
+        if (!be_isstring(vm, 3)) {
+            be_raise(vm, "type_error", "Method must be a string");
+            be_return(vm);
+        }
+        const char *method_str = be_tostring(vm, 3);
+        if (strcasecmp(method_str, "POST") == 0) {
+            http_method = HTTP_POST;
+        } else if (strcasecmp(method_str, "GET") != 0) {
+            be_raise(vm, "value_error", "Method must be 'GET' or 'POST'");
+            be_return(vm);
+        }
     }
     
     const char *uri = be_tostring(vm, 1);
-    ESP_LOGI(TAG, "Registering handler for URI: %s", uri);
+    ESP_LOGI(TAG, "Registering handler for URI: %s, Method: %s", uri, 
+             http_method == HTTP_GET ? "GET" : "POST");
     
     // Find a free handler slot
     int slot = -1;
@@ -713,7 +757,7 @@ static int w_httpserver_on(bvm *vm) {
     
     if (slot < 0) {
         be_raise(vm, "runtime_error", "No more handler slots available");
-        return 0;
+        be_return(vm);
     }
     
     // Store handler info
@@ -729,7 +773,7 @@ static int w_httpserver_on(bvm *vm) {
     // Register the handler with ESP-IDF HTTP server
     httpd_uri_t http_uri = {
         .uri       = uri,
-        .method    = HTTP_GET,
+        .method    = http_method,
         .handler   = berry_handlers[slot],
         .user_ctx  = NULL
     };
@@ -773,12 +817,6 @@ static int w_httpserver_stop(bvm *vm) {
     }
     
     be_pushbool(vm, ret == ESP_OK);
-    be_return (vm);
-}
-
-// Get the server handle (for advanced usage)
-static int w_httpserver_get_handle(bvm *vm) {
-    be_pushint(vm, (int)(intptr_t)http_server);
     be_return (vm);
 }
 
@@ -828,11 +866,10 @@ bool httpserver_has_queue() {
 }
 
 /* @const_object_info_begin
-module httpserver (scope: global) {
+module httpserver (scope: global, strings: weak) {
     start, func(w_httpserver_start)
     on, func(w_httpserver_on)
     send, func(w_httpserver_send)
-    _handle, func(w_httpserver_get_handle)
     stop, func(w_httpserver_stop)
     process_queue, func(w_httpserver_process_queue)
 }

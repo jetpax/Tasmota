@@ -68,6 +68,7 @@ static const char *TAG = "WSS";
 #define HTTP_MSG_FILE 2
 #define HTTP_MSG_WEB 3
 
+
 // Forward declaration for the HTTP server handle getter function
 extern httpd_handle_t be_httpserver_get_handle(void);
 
@@ -97,18 +98,24 @@ static int add_client(int sockfd);
 static int find_client_by_fd(int sockfd);
 static void remove_client(int slot);
 static bool is_client_valid(int slot);
-static void log_ws_frame_info(httpd_ws_frame_t *ws_pkt);
 static void handle_ws_message(int client_id, const char *message, size_t len);
 static void handle_client_disconnect(int client_slot);
 static void callBerryWsDispatcher(bvm *vm, int client_id, const char *event_name, const char *payload, int arg_count);
 static void http_server_disconnect_handler(void* arg, int sockfd);
 static void check_clients(void);
+// Helper functions for server start
+static bool parse_ws_start_parameters(bvm *vm, const char **path);
+static bool register_ws_handler(const char* path);
+static void start_ping_timer(void);
 
 // Globals
-static httpd_handle_t ws_server = NULL;
+httpd_handle_t ws_server = NULL;
+int g_stream_sockfd = -1;
+
 static bool wsserver_running = false;
 static uint32_t ping_interval_s;  // Ping interval in seconds
 static uint32_t ping_timeout_s;   // Activity timeout in seconds
+static esp_timer_handle_t ping_timer = NULL;
 
 // Client status and context
 static ws_client_t ws_clients[MAX_WS_CLIENTS] = {0};
@@ -119,23 +126,6 @@ static be_wsserver_callback_t wsserver_callbacks[3]; // CONNECT, DISCONNECT, MES
 // Forward declaration for processing WebSocket messages in main task context
 void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t len);
 
-// Utility function to log WebSocket frame information
-static void log_ws_frame_info(httpd_ws_frame_t *ws_pkt) {
-    if (!ws_pkt) return;
-    
-    const char* type_str = "UNKNOWN";
-    switch (ws_pkt->type) {
-        case HTTPD_WS_TYPE_CONTINUE: type_str = "CONTINUE"; break;
-        case HTTPD_WS_TYPE_TEXT: type_str = "TEXT"; break;
-        case HTTPD_WS_TYPE_BINARY: type_str = "BINARY"; break;
-        case HTTPD_WS_TYPE_CLOSE: type_str = "CLOSE"; break;
-        case HTTPD_WS_TYPE_PING: type_str = "PING"; break;
-        case HTTPD_WS_TYPE_PONG: type_str = "PONG"; break;
-    }
-    
-    ESP_LOGI(TAG, "WS frame: type=%s, len=%d, final=%d", 
-             type_str, ws_pkt->len, ws_pkt->final ? 1 : 0);
-}
 
 // Call a Berry callback function registered by wsserver.on()
 // CONTEXT: Main Tasmota Task (Berry VM Context)
@@ -324,7 +314,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     
     // Handle control frames immediately without involving Berry VM
     if (ws_pkt.type == HTTPD_WS_TYPE_PONG) {
-        ESP_LOGI(TAG, "Received PONG from client %d", client_slot);
+        // ESP_LOGI(TAG, "Received PONG from client %d", client_slot);
         return ESP_OK;
     } 
     
@@ -335,7 +325,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     }
 
     if (ws_pkt.type == HTTPD_WS_TYPE_PING) {
-        ESP_LOGI(TAG, "Received PING from client %d", client_slot);
+        // ESP_LOGI(TAG, "Received PING from client %d", client_slot);
         httpd_ws_frame_t pong = {0};
         pong.type = HTTPD_WS_TYPE_PONG;
         pong.len = 0;
@@ -583,270 +573,175 @@ static bool is_client_valid(int client_id) {
     return true;
 }
 
+// Helper functions for server start
+static bool parse_ws_start_parameters(bvm *vm, const char **path) {
+    // Check if we have at least the path parameter
+    if (be_top(vm) < 1 || !be_isstring(vm, 1)) {
+        ESP_LOGE(TAG, "Missing or invalid path parameter");
+        return false;
+    }
+    
+    // Get the path parameter
+    *path = be_tostring(vm, 1);
+    ESP_LOGI(TAG, "WebSocket server path: '%s'", *path);
+    
+    // Try to get the handle from the HTTP server
+    httpd_handle_t handle = be_httpserver_get_handle();
+    if (!handle) {
+        ESP_LOGE(TAG, "HTTP server not started. Start HTTP server before WebSocket server");
+        return false;
+    }
+    
+    // Assign to global ws_server variable
+    ws_server = handle;
+    ESP_LOGI(TAG, "Using HTTP server handle: %p", ws_server);
+    
+    // Get ping parameters - now at positions 2 and 3 (no server parameter)
+    ping_interval_s = 5;  // Default: 5 seconds
+    ping_timeout_s = 10;  // Default: 10 seconds
+    
+    // Check for ping interval parameter (position 2)
+    if (be_top(vm) >= 2 && be_isint(vm, 2)) {
+        ping_interval_s = be_toint(vm, 2);
+        
+        // Check for ping timeout parameter (position 3)
+        if (be_top(vm) >= 3 && be_isint(vm, 3)) {
+            ping_timeout_s = be_toint(vm, 3);
+        }
+        
+        ESP_LOGI(TAG, "WebSocket ping configured: interval=%ds, timeout=%ds", 
+                 ping_interval_s, ping_timeout_s);
+    }
+    
+    return true;
+}
+
+static bool register_ws_handler(const char* path) {
+    // Register URI handler for WebSocket endpoint
+    httpd_uri_t ws_uri = {
+        .uri        = path,
+        .method     = HTTP_GET,
+        .handler    = ws_handler,
+        .user_ctx   = NULL,
+        .is_websocket = true,
+        .handle_ws_control_frames = true  // Allow ESP-IDF to properly handle control frames
+    };
+    
+    ESP_LOGI(TAG, "Registering WebSocket handler for '%s'", path);
+    esp_err_t ret = httpd_register_uri_handler(ws_server, &ws_uri);
+    
+    if (ret != ESP_OK) {
+        // Check if the handler already exists (which is acceptable)
+        if (ret == ESP_ERR_HTTPD_HANDLER_EXISTS) {
+            ESP_LOGW(TAG, "WebSocket handler for '%s' already exists, continuing", path);
+            return true;
+        }
+        
+        ESP_LOGE(TAG, "Failed to register URI handler: %d (0x%x)", ret, ret);
+        
+        // We always use the existing server now, so don't stop it
+        ESP_LOGI(TAG, "Using existing HTTP server, not stopping it despite URI registration failure");
+        
+        wsserver_running = false;
+        return false;
+    }
+    
+    return true;
+}
+
+static void start_ping_timer(void) {
+    if (ping_interval_s > 0) {
+        ESP_LOGI(TAG, "Starting ping timer with interval %ds", ping_interval_s);
+        esp_timer_create_args_t timer_args = {
+            .callback = ws_ping_timer_callback,
+            .name = "ws_ping"
+        };
+        esp_timer_create(&timer_args, &ping_timer);
+        esp_timer_start_periodic(ping_timer, ping_interval_s * 1000000); // seconds to microseconds
+    }
+}
+
 // Berry Interface Functions
 static int w_wsserver_start(bvm *vm) {
+    // Handle the case when server is already running - just update parameters
     if (wsserver_running) {
         ESP_LOGI(TAG, "WebSocket server already running");
-        // Don't just return true - we should still update the path or other parameters
-        // if they've changed, but don't re-register the handlers
+        
         if (be_top(vm) >= 1 && be_isstring(vm, 1)) {
-            const char* path = be_tostring(vm, 1);
-            
-            // Get optional ping parameters
-            if (be_top(vm) >= 3 && be_isint(vm, 3)) {
-                ping_interval_s = be_toint(vm, 3);
+            // Get optional ping parameters and update them (positions 2 and 3)
+            if (be_top(vm) >= 2 && be_isint(vm, 2)) {
+                ping_interval_s = be_toint(vm, 2);
                 ESP_LOGD(TAG, "Updated ping interval to %d seconds", ping_interval_s);
             }
             
-            if (be_top(vm) >= 4 && be_isint(vm, 4)) {
-                ping_timeout_s = be_toint(vm, 4);
+            if (be_top(vm) >= 3 && be_isint(vm, 3)) {
+                ping_timeout_s = be_toint(vm, 3);
                 ESP_LOGD(TAG, "Updated ping timeout to %d seconds", ping_timeout_s);
             }
         }
         
         be_pushbool(vm, true);
-        be_return (vm);
+        be_return(vm);
     }
     
-    ESP_LOGI(TAG, "Init WebSocket server");
-    if (be_top(vm) >= 1 && be_isstring(vm, 1)) {
-        const char* path = be_tostring(vm, 1);
-        ESP_LOGI(TAG, "Starting WebSocket server on path '%s'", path);
-        
-        // Get optional http_handle parameter
-        bool use_existing_handle = false;
-        if (be_top(vm) >= 2) {
-            // First try as comptr
-            if (be_iscomptr(vm, 2)) {
-                void* http_handle = be_tocomptr(vm, 2);
-                use_existing_handle = true;
-                if (http_handle == NULL) {
-                    ESP_LOGE(TAG, "HTTP server handle is NULL");
-                    be_pushbool(vm, false);
-                    be_return (vm);
-                }
-                
-                // Assign to global ws_server variable after validating it's not NULL
-                ws_server = http_handle;
-                ESP_LOGD(TAG, "Using existing HTTP server handle (comptr): %p", ws_server);
-            } 
-            // If not comptr, try to get httpd_handle_t from Berry externally
-            else {
-                // First log that we're attempting to get the handle
-                ESP_LOGD(TAG, "Attempting to retrieve HTTP server handle via be_httpserver_get_handle()");
-                
-                // Try to get the handle from the HTTP server
-                httpd_handle_t handle = be_httpserver_get_handle();
-                ESP_LOGD(TAG, "Got HTTP server handle: %p", handle);
-                if (handle) {
-                    use_existing_handle = true;
-                    ws_server = handle;
-                    ESP_LOGD(TAG, "Using HTTP server handle from httpserver module: %p", ws_server);
-                } else {
-                    ESP_LOGE(TAG, "HTTP server module returned NULL handle");
-                }
-            }
-        }
-        
-        // Get optional ping_interval parameter (0 = disabled)
-        ping_interval_s = 5;  // Default: 5 seconds
-        ping_timeout_s = 10;  // Default: 10 seconds
-        
-        if (be_top(vm) >= 3 && be_isint(vm, 3)) {
-            ping_interval_s = be_toint(vm, 3);
-            
-            // Optional ping_timeout parameter
-            if (be_top(vm) >= 4 && be_isint(vm, 4)) {
-                ping_timeout_s = be_toint(vm, 4);
-            }
-            
-            ESP_LOGI(TAG, "WebSocket ping configured: interval=%ds, timeout=%ds", 
-                     ping_interval_s, ping_timeout_s);
-        }
-        
-        // Initialize the client array
-        init_clients();
-        
-        // Handle HTTP server setup
-        if (use_existing_handle) {
-            // If using an existing handle, just register our disconnect handler
-            ESP_LOGI(TAG, "Using existing HTTP server, skipping server creation");
-            ESP_LOGI(TAG, "Registering disconnect handler with existing server");
-            be_httpserver_set_disconnect_handler(http_server_disconnect_handler);
-        } else {
-            // Create a new HTTP server
-            ESP_LOGI(TAG, "No HTTP server provided, creating a new one");
-            // Configure and start the HTTP server
-            httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-            config.server_port = 8080;  // Use a different port from Tasmota web server
-            config.max_open_sockets = MAX_WS_CLIENTS + 2;  // +2 for admin connections
-            config.max_uri_handlers = 2;  // For WebSocket and potential health check
-            config.lru_purge_enable = true;  // Enable LRU connection purging
-            config.recv_wait_timeout = 10;  // 10 seconds timeout for receiving
-            config.send_wait_timeout = 10;  // 10 seconds timeout for sending
-            config.core_id = 1;           // Run on second core for better performance isolation
-            
-            // Set disconnect handler
-            config.close_fn = http_server_disconnect_handler;
-            ESP_LOGD(TAG, "Registering disconnect handler for new WebSocket server");
-            
-            ESP_LOGI(TAG, "Starting new HTTP server on port %d", config.server_port);
-            esp_err_t ret = httpd_start(&ws_server, &config);
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to start server: %d (0x%x)", ret, ret);
-                wsserver_running = false;
-                ws_server = NULL;
-                be_pushbool(vm, false);
-                be_return (vm);
-            }
-            ESP_LOGI(TAG, "New HTTP server started on port %d", config.server_port);
-        }
-        
-        // Register URI handler for WebSocket endpoint
-        httpd_uri_t ws_uri = {
-            .uri        = path,
-            .method     = HTTP_GET,
-            .handler    = ws_handler,  // Use the connect handler which properly registers clients
-            .user_ctx   = NULL,
-            .is_websocket = true,
-            .handle_ws_control_frames = true  // Allow ESP-IDF to properly handle control frames
-        };
-        
-        ESP_LOGI(TAG, "Registering WebSocket handler for '%s'", path);
-        esp_err_t ret = httpd_register_uri_handler(ws_server, &ws_uri);
-        if (ret != ESP_OK) {
-            // Check if the error is just that the handler already exists
-            if (ret == ESP_ERR_HTTPD_HANDLER_EXISTS) {
-                ESP_LOGW(TAG, "WebSocket handler for '%s' already exists, continuing", path);
-                // This is actually OK, just continue
-            } else {
-                ESP_LOGE(TAG, "Failed to register URI handler: %d (0x%x)", ret, ret);
-                // Only stop the server if we created it
-                if (!use_existing_handle) {
-                    httpd_stop(ws_server);
-                } else {
-                    // When using an existing handle, we need to be careful not to nullify it
-                    // since it's managed externally
-                    ESP_LOGI(TAG, "Using existing HTTP server, not stopping it despite URI registration failure");
-                }
-                wsserver_running = false;  // Mark as not running
-                be_pushbool(vm, false);
-                be_return (vm);
-            }
-        }
-                
-        // Set up ping timer if enabled - direct conversion from seconds to microseconds
-        if (ping_interval_s > 0) {
-            ESP_LOGI(TAG, "Starting ping timer with interval %ds", ping_interval_s);
-            esp_timer_handle_t ping_timer = NULL;
-            esp_timer_create_args_t timer_args = {
-                .callback = ws_ping_timer_callback,
-                .name = "ws_ping"
-            };
-            esp_timer_create(&timer_args, &ping_timer);
-            esp_timer_start_periodic(ping_timer, ping_interval_s * 1000000); // seconds to microseconds
-        }
-        
-        wsserver_running = true;
-        ESP_LOGI(TAG, "WebSocket server started successfully");
-        be_pushbool(vm, true);
-        be_return (vm);
+    // Initialize a new server
+    ESP_LOGI(TAG, "Initializing WebSocket server");
+    
+    // Parse parameters
+    const char* path = NULL;
+    
+    if (!parse_ws_start_parameters(vm, &path)) {
+        be_pushbool(vm, false);
+        be_return(vm);
     }
     
-    ESP_LOGE(TAG, "Invalid path parameter");
-    be_pushbool(vm, false);
-    be_return (vm);
+    // Initialize client tracking
+    init_clients();
+    
+    // Register disconnect handler with existing server
+    ESP_LOGI(TAG, "Registering disconnect handler with HTTP server");
+    be_httpserver_set_disconnect_handler(http_server_disconnect_handler);
+    
+    // Register the WebSocket handler
+    if (!register_ws_handler(path)) {
+        be_pushbool(vm, false);
+        be_return(vm);
+    }
+    
+    // Start the ping timer if needed
+    start_ping_timer();
+    
+    // Mark server as running
+    wsserver_running = true;
+    ESP_LOGI(TAG, "WebSocket server started successfully");
+    
+    be_pushbool(vm, true);
+    be_return(vm);
 }
 
-static int w_wsserver_client_info(bvm *vm) {
-    int initial_top = be_top(vm);  // Save initial stack position for debugging
-    
-    ESP_LOGI(TAG, "client_info: Initial stack top: %d", initial_top);
-    
+
+static int w_wsserver_start_capture(bvm *vm) {
+    bool success = false;
+    // Expect client_id (int)
     if (be_top(vm) >= 1 && be_isint(vm, 1)) {
-        int client_slot = be_toint(vm, 1);
-        
-        if (!is_client_valid(client_slot)) {
-            ESP_LOGE(TAG, "client_info: Invalid client %d, returning nil", client_slot);
-            be_pushnil(vm);
-            
-            // Check stack for consistency
-            int final_top = be_top(vm);
-            ESP_LOGI(TAG, "client_info: Invalid client path - Final stack: %d (expected %d)", 
-                     final_top, initial_top + 1);
-            be_return (vm);
+        int client_id = be_toint(vm, 1);
+        if (ws_clients[client_id].active && ws_clients[client_id].sockfd >= 0) {
+            g_stream_sockfd = ws_clients[client_id].sockfd;
+            success = true;
+        } else {
+            ESP_LOGE(TAG, "Client %d is not active (active=%d, sockfd=%d)", 
+                    client_id, ws_clients[client_id].active, ws_clients[client_id].sockfd);
         }
-        
-        // Calculate time since last activity
-        int64_t now = esp_timer_get_time();
-        int64_t inactive_time_ms = ((now / 1000) - ws_clients[client_slot].last_activity) / 1000; // convert to milliseconds
-        
-        // Create map with client info - this adds one item to the stack
-        be_newmap(vm);
-        int after_map_top = be_top(vm);
-        ESP_LOGI(TAG, "client_info: After map creation - Stack: %d", after_map_top);
-        
-        // Add client socket fd - Key
-        be_pushstring(vm, "socket");
-        // Add client socket fd - Value
-        be_pushint(vm, ws_clients[client_slot].sockfd);
-        // Insert into map - consumes the key and value, leaving map on stack
-        be_data_insert(vm, -3);
-        // No need for explicit pop here as be_data_insert consumes key and value
-        
-        // Add last activity timestamp - Key
-        be_pushstring(vm, "last_activity");
-        // Add last activity timestamp - Value
-        be_pushint(vm, (int)(ws_clients[client_slot].last_activity / 1000000)); // seconds
-        // Insert into map - consumes the key and value, leaving map on stack
-        be_data_insert(vm, -3);
-        // No need for explicit pop here as be_data_insert consumes key and value
-        
-        // Add inactivity duration - Key
-        be_pushstring(vm, "inactive_ms");
-        // Add inactivity duration - Value
-        be_pushint(vm, (int)inactive_time_ms);
-        // Insert into map - consumes the key and value, leaving map on stack
-        be_data_insert(vm, -3);
-        // No need for explicit pop here as be_data_insert consumes key and value
-        
-        // At this point there should be exactly one item on the stack (the map)
-        // beyond what was there when we started
-        int final_top = be_top(vm);
-        ESP_LOGI(TAG, "client_info: Final stack: %d (expected %d)", final_top, initial_top + 1);
-        
-        // The map is already on the stack as our return value
-        be_return (vm);
+        be_pushbool(vm, success);
+        be_return(vm);  /* return self */
     }
-    
-    // If we reach here, either there were no parameters or the parameter was not an integer
-    ESP_LOGI(TAG, "client_info: Invalid parameters, returning nil");
-    be_pushnil(vm);
-    
-    // Check stack for consistency
-    int final_top = be_top(vm);
-    ESP_LOGI(TAG, "client_info: Error path - Final stack: %d (expected %d)", 
-             final_top, initial_top + 1);
-    be_return (vm);
-}
+    be_raise(vm, "attribute_error", NULL);
+} 
 
-static int w_wsserver_count_clients(bvm *vm) {
-    int initial_top = be_top(vm);
-    ESP_LOGI(TAG, "wsserver_count_clients: Initial stack top: %d", initial_top);
-    
-    int count = 0;
-    for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-        if (ws_clients[i].active) {
-            count++;
-        }
-    }
-    
-    be_pushint(vm, count);
-    
-    int final_top = be_top(vm);
-    ESP_LOGI(TAG, "wsserver_count_clients: Final stack: %d (expected %d), returning %d clients", 
-             final_top, initial_top + 1, count);
-    be_return (vm);
+
+static int w_wsserver_stop_capture(bvm *vm) {
+    g_stream_sockfd = -1;
+    be_return_nil(vm);
 }
 
 static int w_wsserver_send(bvm *vm) {
@@ -910,7 +805,7 @@ static int w_wsserver_send(bvm *vm) {
         // For normal strings, get the length from Berry
         len = be_strlen(vm, 2);
         data = be_tostring(vm, 2);
-        ESP_LOGI(TAG, "Got string with length: %d", (int)len);
+        ESP_LOGI(TAG, "Got string %s with length: %d", data, (int)len);
     }
     
     if (len == 0 || data == NULL) {
@@ -1020,7 +915,9 @@ static int w_wsserver_close(bvm *vm) {
             be_pushbool(vm, false);
             be_return (vm);
         }
-        
+
+        esp_timer_delete(ping_timer);
+
         // Send a close frame
         httpd_ws_frame_t ws_pkt = {0};
         ws_pkt.type = HTTPD_WS_TYPE_CLOSE;
@@ -1136,10 +1033,6 @@ static int w_wsserver_stop(bvm *vm) {
     if (!wsserver_running) {
         ESP_LOGI(TAG, "WebSocket server not running");
         be_pushbool(vm, true);
-        
-        int final_top = be_top(vm);
-        ESP_LOGI(TAG, "wsserver_stop: Server not running - Final stack: %d (expected %d)", 
-                 final_top, 1);
         be_return (vm);
     }
     
@@ -1181,23 +1074,12 @@ static int w_wsserver_stop(bvm *vm) {
     // Log how many clients were closed
     ESP_LOGI(TAG, "Closed connections to %d client(s)", client_count);
     
-    // Stop HTTP server
-    ESP_LOGI(TAG, "Stopping HTTP server");
-    esp_err_t ret = httpd_stop(ws_server);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to stop server: %d (0x%x)", ret, ret);
-    } else {
-        ESP_LOGI(TAG, "HTTP server stopped successfully");
-    }
-    
+    // We don't stop the HTTP server anymore since we're using an existing one
+    // Just clear our reference to it
     ws_server = NULL;
     wsserver_running = false;
     
-    be_pushbool(vm, (ret == ESP_OK));
-    
-    int final_top = be_top(vm);
-    ESP_LOGI(TAG, "wsserver_stop: Final stack: %d (expected %d), success: %s", 
-             final_top, 2, (ret == ESP_OK) ? "true" : "false");
+    be_pushbool(vm, true);
     be_return (vm);
 }
 
@@ -1310,9 +1192,9 @@ module wsserver (scope: global) {
     close, func(w_wsserver_close)
     on, func(w_wsserver_on)
     is_connected, func(w_wsserver_is_connected)
-    client_info, func(w_wsserver_client_info)
-    count_clients, func(w_wsserver_count_clients)
-    
+    start_capture, func(w_wsserver_start_capture)
+    stop_capture, func(w_wsserver_stop_capture)
+
     // Constants for supported frame types
     TEXT, int(HTTPD_WS_TYPE_TEXT)
     BINARY, int(HTTPD_WS_TYPE_BINARY)
