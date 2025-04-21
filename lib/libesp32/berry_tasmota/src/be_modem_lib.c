@@ -12,10 +12,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-// Include only the C API for ESP Modem
-#include "esp_modem_api.h"
+
 #include "esp_modem_c_api_types.h"
-#include "esp_modem_config.h"
 
 // Include Arduino.h for GPIO operations 
 #include "Arduino.h"
@@ -435,8 +433,7 @@ static int w_modem_init(bvm *vm) {
     esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG("internet");
     
     // Create the DCE using esp_modem_new_dev() with a specific model
-    // ESP_MODEM_DCE_GENETIC is the correct enum value (not GENERIC)
-    g_modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENETIC, &dte_config, &dce_config, g_modem_netif);
+    g_modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENERIC, &dte_config, &dce_config, g_modem_netif);
     
     if (g_modem_dce == NULL) {
         ESP_LOGE(TAG, "Failed to create modem DCE");
@@ -497,7 +494,7 @@ static int w_modem_init_usb(bvm *vm) {
     esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG("internet");
     
     // Create the DCE using esp_modem_new_dev()
-    g_modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENETIC, &dte_config, &dce_config, g_modem_netif);
+    g_modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENERIC, &dte_config, &dce_config, g_modem_netif);
     
     if (g_modem_dce == NULL) {
         ESP_LOGE(TAG, "Failed to create modem DCE with USB");
