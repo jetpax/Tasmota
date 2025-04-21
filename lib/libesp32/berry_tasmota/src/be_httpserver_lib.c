@@ -41,7 +41,6 @@
 // External function declarations
 httpd_handle_t be_httpserver_get_handle(void);
 void be_httpserver_set_disconnect_handler(httpd_close_func_t handler);
-bool httpserver_has_queue(void);
 
 // Message types for queue
 typedef enum {
@@ -122,26 +121,7 @@ static void http_connection_cleanup(void *arg) {
 // File request processing function
 static void be_httpserver_process_file_request(bvm *vm, void *user_data) {
     ESP_LOGI(TAG, "Processing file request (placeholder)");
-    // Placeholder for file handling - to be extended as needed
-}
-
-
-// Initialize the message queue
-static bool init_http_queue() {
-    if (!http_queue_initialized) {
-        http_msg_queue = xQueueCreate(10, sizeof(http_queue_msg_t));
-        http_queue_mutex = xSemaphoreCreateMutex();
-        
-        if (http_msg_queue != NULL && http_queue_mutex != NULL) {
-            http_queue_initialized = true;
-            ESP_LOGI(TAG, "HTTP queue initialized");
-            return true;
-        } else {
-            ESP_LOGE(TAG, "Failed to create HTTP queue");
-            return false;
-        }
-    }
-    return true;
+    // Placeholder - to be extended if Berry file handling is needed
 }
 
 // Queue a message for processing in the main task
@@ -577,7 +557,7 @@ static esp_err_t berry_http_handler_impl(httpd_req_t *req, int handler_id) {
     ESP_LOGI(TAG, "HANDLER: Initial stack top = %d", be_top(vm));
     
     // Queue message for processing in main task if available
-    if (httpserver_has_queue()) {
+    if (http_queue_initialized) {
         ESP_LOGI(TAG, "Queueing request for %s", req->uri);
         
         // Queue the request with the stored function value
@@ -706,7 +686,19 @@ static int w_httpserver_start(bvm *vm) {
     ESP_LOGI(TAG, "HTTP server started successfully");
     
     // Initialize the queue for thread-safe message passing
-    init_http_queue();
+    if (!http_queue_initialized) {
+        http_msg_queue = xQueueCreate(10, sizeof(http_queue_msg_t));
+        http_queue_mutex = xSemaphoreCreateMutex();
+        
+        if (http_msg_queue != NULL && http_queue_mutex != NULL) {
+            http_queue_initialized = true;
+            ESP_LOGI(TAG, "HTTP queue initialized");
+            return true;
+        } else {
+            ESP_LOGE(TAG, "Failed to create HTTP queue");
+            return false;
+        }
+    }
     
     be_pushbool(vm, true);
     be_return (vm);
@@ -860,10 +852,6 @@ httpd_handle_t be_httpserver_get_handle(void) {
     return http_server;
 }
 
-// Function to check if message queue is available (referenced by wsserver)
-bool httpserver_has_queue() {
-    return http_queue_initialized;
-}
 
 /* @const_object_info_begin
 module httpserver (scope: global, strings: weak) {

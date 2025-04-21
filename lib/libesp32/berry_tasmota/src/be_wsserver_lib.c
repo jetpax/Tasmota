@@ -73,7 +73,6 @@ static const char *TAG = "WSS";
 extern httpd_handle_t be_httpserver_get_handle(void);
 
 // Declarations for functions used by httpserver_lib
-extern bool httpserver_has_queue(void);
 extern bool httpserver_queue_message(int msg_type, int client_id, 
                                 const void *data, size_t data_len, void *user_data);
 
@@ -259,23 +258,8 @@ static esp_err_t ws_handler(httpd_req_t *req) {
             // Queue connect event for processing in main task
             // TRANSITION: ESP-IDF HTTP Server Task → Main Tasmota Task
             // Use NULL as data to indicate this is a connect event
-            if (httpserver_has_queue()) {
-                bool queue_result = httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, 
-                                                   NULL, 0, NULL);
-                
-                if (queue_result) {
-                    ESP_LOGI(TAG, "WebSocket connect event successfully queued");
-                } else {
-                    ESP_LOGE(TAG, "Failed to queue WebSocket connect event!");
-                }
-            } else {
-                ESP_LOGW(TAG, "No queue available for connect event - fallback to direct processing");
-                // Fallback to direct processing (not recommended)
-                if (wsserver_callbacks[WSSERVER_EVENT_CONNECT].active) {
-                    const char *event_name = "connect";
-                    callBerryWsDispatcher(wsserver_callbacks[WSSERVER_EVENT_CONNECT].vm, 
-                                         client_slot, event_name, NULL, 2);
-                }
+            if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, NULL, 0, NULL)) {
+                ESP_LOGE(TAG, "WS Q connect failed!");
             }
         }
         
@@ -377,6 +361,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
 }
 
 // Handle a WebSocket message from a client
+// CONTEXT: ESP-IDF HTTP Server Task
 void handle_ws_message(int client_id, const char *message, size_t len) {
     if (!message || len == 0) {
         ESP_LOGE(TAG, "Received empty message from client %d", client_id);
@@ -387,29 +372,20 @@ void handle_ws_message(int client_id, const char *message, size_t len) {
     if (client_id >= 0 && client_id < MAX_WS_CLIENTS && ws_clients[client_id].active) {
         ws_clients[client_id].last_activity = esp_timer_get_time() / 1000;
     }
+
+    // Make a copy of the message data for the queue
+    char *data_copy = malloc(len);
+    if (!data_copy) {
+        ESP_LOGE(TAG, "Failed to allocate memory for message copy");
+        return;
     
-    // If queue available, send to main task for processing
-    if (httpserver_has_queue()) {
-        ESP_LOGD(TAG, "Queueing WebSocket message from client %d: '%.*s'", client_id, (int)len, message);
-        
-        // Make a copy of the message data for the queue
-        char *data_copy = malloc(len);
-        if (!data_copy) {
-            ESP_LOGE(TAG, "Failed to allocate memory for message copy");
-            return;
-        }
-        
-        memcpy(data_copy, message, len);
-        
-        // Queue the message
-        if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_id, data_copy, len, NULL)) {
-            ESP_LOGE(TAG, "Failed to queue WebSocket message");
-            free(data_copy);
-        }
-    } else {
-        // No queue available, process directly (not recommended but fallback)
-        ESP_LOGW(TAG, "Processing WebSocket message directly without queue - this may be unsafe");
-        callBerryWsDispatcher(NULL, client_id, "message", message, 2);
+    memcpy(data_copy, message, len);
+    }
+    
+    // Queue the message
+    if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_id, data_copy, len, NULL)) {
+        ESP_LOGE(TAG, "WS Q message failed!");
+        free(data_copy);
     }
 }
 
@@ -420,51 +396,22 @@ static void handle_client_disconnect(int client_slot) {
     if (!is_client_valid(client_slot)) {
         return;
     }
-    
-    ESP_LOGI(TAG, "Client %d disconnected", client_slot);
-    
-    // Queue disconnect event for processing in main task
-    // Use NULL as data to indicate this is a disconnect event
-    if (httpserver_has_queue()) {
-        // Save sockfd for later removal
-        int sockfd = ws_clients[client_slot].sockfd;
-        
-        // Mark client as inactive BEFORE queuing the event
-        // This ensures the event processor knows it's a disconnect event
-        ws_clients[client_slot].active = false;
-        
-        bool queue_result = httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, 
-                                           NULL, 0, NULL);
-        
-        if (queue_result) {
-            ESP_LOGD(TAG, "WebSocket disconnect event successfully queued");
-        } else {
-            ESP_LOGE(TAG, "Failed to queue WebSocket disconnect event!");
-            
-            // Fallback to direct processing
-            if (wsserver_callbacks[WSSERVER_EVENT_DISCONNECT].active) {
-                const char *event_name = "disconnect";
-                callBerryWsDispatcher(wsserver_callbacks[WSSERVER_EVENT_DISCONNECT].vm, 
-                                     client_slot, event_name, NULL, 2);
-            }
-            
-            // Ensure cleanup happens if queue fails
-            ws_clients[client_slot].sockfd = -1;
-        }
-    } else {
-        ESP_LOGW(TAG, "No queue available for disconnect event - fallback to direct processing");
-        
-        // Fallback to direct processing (not recommended)
-        if (wsserver_callbacks[WSSERVER_EVENT_DISCONNECT].active) {
-            const char *event_name = "disconnect";
-            callBerryWsDispatcher(wsserver_callbacks[WSSERVER_EVENT_DISCONNECT].vm, 
-                                 client_slot, event_name, NULL, 2);
-        }
-        
-        // Always clean up client slot
+
+    ESP_LOGI(TAG, "WS Client %d disconnected", client_slot);
+    int sockfd = ws_clients[client_slot].sockfd;
+
+    // Mark client as inactive BEFORE queuing the event
+    // This ensures the event processor knows it's a disconnect event
+    ws_clients[client_slot].active = false;
+
+    if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, NULL, 0, NULL)) {
+        ESP_LOGE(TAG, "WS Q HTTPdisconnect failed!");
+        // Ensure cleanup happens if queuing fails
         ws_clients[client_slot].sockfd = -1;
-        ws_clients[client_slot].active = false;
+        // Fallback to direct handling ???
+        handle_client_disconnect(client_slot);
     }
+
 }
 
 // Timer callback for pinging clients
@@ -1143,25 +1090,14 @@ static void http_server_disconnect_handler(void* arg, int sockfd) {
     }
     
     ESP_LOGI(TAG, "Found WebSocket client %d for socket %d", client_slot, sockfd);
+   
+    // Mark client as inactive BEFORE queuing the event
+    // This ensures the Berry WS event processor knows it's a disconnect event
+    ws_clients[client_slot].active = false;
     
-    // Queue disconnect event for processing in main task
-    if (httpserver_has_queue()) {
-        // Mark client as inactive BEFORE queuing the event
-        // This ensures the event processor knows it's a disconnect event
-        ws_clients[client_slot].active = false;
-        
-        bool queue_result = httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, 
-                                           NULL, 0, NULL);
-        
-        if (queue_result) {
-            ESP_LOGI(TAG, "WebSocket disconnect event successfully queued from HTTP handler");
-        } else {
-            ESP_LOGE(TAG, "Failed to queue WebSocket disconnect event from HTTP handler!");
-            // Fallback to direct handling
-            handle_client_disconnect(client_slot);
-        }
-    } else {
-        ESP_LOGW(TAG, "No queue available for disconnect event - fallback to direct processing");
+    if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, NULL, 0, NULL)) {
+        ESP_LOGE(TAG, "WS Q HTTPdisconnect failed!");
+        // Fallback to direct handling ???
         handle_client_disconnect(client_slot);
     }
 }

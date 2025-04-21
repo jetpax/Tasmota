@@ -33,8 +33,6 @@
 
 // External Berry/Tasmota includes
 extern httpd_handle_t be_httpserver_get_handle(void);
-extern bool httpserver_queue_message(int type, int client_id, 
-                                const char* data, size_t len, void* user_data);
 
 // Tag for logging
 static const char *TAG = "WEBFILES";
