@@ -23,10 +23,18 @@
 #define LOG_LOCAL_LEVEL ESP_LOG_INFO
 #endif
 
+// Berry includes
 #include "be_constobj.h"
 #include "be_mapping.h"
 #include "be_exec.h"
 #include "be_vm.h"
+#include "be_object.h"
+#include "be_string.h"
+#include "be_gc.h"
+#include "be_debug.h"
+#include "be_map.h"
+#include "be_list.h"
+#include "be_module.h"
 
 // Standard C includes
 #include <stdlib.h>
@@ -42,16 +50,6 @@
 // Socket-related includes
 #include <sys/socket.h>
 #include <netinet/in.h>
-
-#include "be_object.h"
-#include "be_string.h"
-#include "be_gc.h"
-#include "be_exec.h"
-#include "be_debug.h"
-#include "be_map.h"
-#include "be_list.h"
-#include "be_module.h"
-#include "be_vm.h"
 
 static const char *TAG = "WSS";
 
@@ -71,6 +69,9 @@ static const char *TAG = "WSS";
 
 // Forward declaration for the HTTP server handle getter function
 extern httpd_handle_t be_httpserver_get_handle(void);
+
+// Declaration for HTTP server callback registration
+extern void httpserver_register_external_close_cb(void (*func)(int sockfd));
 
 // Declarations for functions used by httpserver_lib
 extern bool httpserver_queue_message(int msg_type, int client_id, 
@@ -100,7 +101,6 @@ static bool is_client_valid(int slot);
 static void handle_ws_message(int client_id, const char *message, size_t len);
 static void handle_client_disconnect(int client_slot);
 static void callBerryWsDispatcher(bvm *vm, int client_id, const char *event_name, const char *payload, int arg_count);
-static void http_server_disconnect_handler(void* arg, int sockfd);
 static void check_clients(void);
 // Helper functions for server start
 static bool parse_ws_start_parameters(bvm *vm, const char **path);
@@ -389,6 +389,20 @@ void handle_ws_message(int client_id, const char *message, size_t len) {
     }
 }
 
+// WebSocket socket cleanup callback for HTTP server
+// CONTEXT: ESP-IDF HTTP Server Task
+// This gets called by the HTTP server when any socket closes
+static void wsserver_socket_cleanup_cb(int sockfd) {
+    // Find which client this socket belongs to
+    int client_slot = find_client_by_fd(sockfd);
+    
+    if (client_slot >= 0) {
+        ESP_LOGI(TAG, "Socket %d closed, corresponds to WS client %d", sockfd, client_slot);
+        // Handle client disconnection
+        handle_client_disconnect(client_slot);
+    }
+}
+
 // Handle client disconnection
 // CONTEXT: ESP-IDF HTTP Server Task
 // Called when the server detects a client disconnection
@@ -408,10 +422,7 @@ static void handle_client_disconnect(int client_slot) {
         ESP_LOGE(TAG, "WS Q HTTPdisconnect failed!");
         // Ensure cleanup happens if queuing fails
         ws_clients[client_slot].sockfd = -1;
-        // Fallback to direct handling ???
-        handle_client_disconnect(client_slot);
     }
-
 }
 
 // Timer callback for pinging clients
@@ -645,9 +656,9 @@ static int w_wsserver_start(bvm *vm) {
     // Initialize client tracking
     init_clients();
     
-    // Register disconnect handler with existing server
-    ESP_LOGI(TAG, "Registering disconnect handler with HTTP server");
-    be_httpserver_set_disconnect_handler(http_server_disconnect_handler);
+    // Register socket close callback with HTTP server
+    ESP_LOGI(TAG, "Registering socket close callback with HTTP server");
+    httpserver_register_external_close_cb(wsserver_socket_cleanup_cb);
     
     // Register the WebSocket handler
     if (!register_ws_handler(path)) {
@@ -1076,43 +1087,6 @@ void be_wsserver_cb_deinit(bvm *vm) {
     
     ESP_LOGI(TAG, "[DEINIT] Completed callback deinitialization: %d active callbacks, %d GC protected", 
              count_active, count_gc_protected);
-}
-
-// Handle disconnect event from the HTTP server
-static void http_server_disconnect_handler(void* arg, int sockfd) {
-    ESP_LOGI(TAG, "HTTP server disconnect handler called for socket %d", sockfd);
-    
-    // Find the client slot for this socket
-    int client_slot = find_client_by_fd(sockfd);
-    if (client_slot < 0) {
-        ESP_LOGI(TAG, "No WebSocket client found for socket %d", sockfd);
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Found WebSocket client %d for socket %d", client_slot, sockfd);
-   
-    // Mark client as inactive BEFORE queuing the event
-    // This ensures the Berry WS event processor knows it's a disconnect event
-    ws_clients[client_slot].active = false;
-    
-    if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, NULL, 0, NULL)) {
-        ESP_LOGE(TAG, "WS Q HTTPdisconnect failed!");
-        // Fallback to direct handling ???
-        handle_client_disconnect(client_slot);
-    }
-}
-
-// Disconnect handler for httpd_register_uri_handler
-esp_err_t websocket_disconnect_handler(httpd_handle_t hd, int sockfd) {
-    ESP_LOGI(TAG, "WebSocket disconnect handler called for socket %d", sockfd);
-    
-    int client_slot = find_client_by_fd(sockfd);
-    if (client_slot >= 0) {
-        // Call Berry disconnect callback directly
-        handle_client_disconnect(client_slot);
-    }
-    
-    return ESP_OK;
 }
 
 // Module definition

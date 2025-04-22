@@ -40,7 +40,7 @@
 
 // External function declarations
 httpd_handle_t be_httpserver_get_handle(void);
-void be_httpserver_set_disconnect_handler(httpd_close_func_t handler);
+void httpserver_register_external_close_cb(void (*func)(int sockfd));
 
 // Message types for queue
 typedef enum {
@@ -63,6 +63,14 @@ typedef struct {
 // Forward declarations for internal functions
 bool httpserver_queue_message(http_msg_type_t type, int client_id, const void *data, size_t data_len, void *user_data);
 bool httpserver_queue_web_request(int handler_id, httpd_req_t *req, bvalue func);
+
+// Simple callback for socket closures
+static void (*external_close_callback)(int sockfd) = NULL;
+
+// Function for external modules to register their cleanup function
+void httpserver_register_external_close_cb(void (*func)(int sockfd)) {
+    external_close_callback = func;
+}
 
 // Logger tag
 static const char *TAG = "HTTPSERVER";
@@ -90,9 +98,6 @@ static http_handler_t http_handlers[HTTP_HANDLER_MAX];
 // Handle to HTTP server
 static httpd_handle_t http_server = NULL;
 
-// Disconnect handler for WebSocket connections
-static httpd_close_func_t http_server_disconn_handler = NULL;
-
 // Current HTTP request being processed (for Berry access)
 static httpd_req_t *current_request = NULL;
 
@@ -110,10 +115,10 @@ static void http_connection_cleanup(void *arg) {
         connection_tracking.count--;
         xSemaphoreGive(connection_tracking.mutex);
         
-        // Call WebSocket disconnect handler if registered
-        if (http_server_disconn_handler) {
+        // Call external close callback if registered
+        if (external_close_callback) {
             // arg is the socket file descriptor in this context
-            http_server_disconn_handler(NULL, (int)(intptr_t)arg);
+            external_close_callback((int)(intptr_t)arg);
         }
     }
 }
@@ -842,16 +847,13 @@ static int w_httpserver_send(bvm *vm) {
     be_return_nil(vm);
 }
 
-// Set WebSocket disconnect handler
-void be_httpserver_set_disconnect_handler(httpd_close_func_t handler) {
-    http_server_disconn_handler = handler;
-}
-
 // Get HTTP server handle
 httpd_handle_t be_httpserver_get_handle(void) {
     return http_server;
 }
 
+// Export the socket close callback registration function
+extern void httpserver_register_external_close_cb(void (*func)(int sockfd));
 
 /* @const_object_info_begin
 module httpserver (scope: global, strings: weak) {
