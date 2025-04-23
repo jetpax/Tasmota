@@ -270,146 +270,143 @@ bool httpserver_queue_web_request(int handler_id, httpd_req_t *req, bvalue func)
 // ------------------------------------------------------------------------
 
 void be_httpserver_process_web_request(bvm *vm, http_queue_msg_t *msg) {
-  ESP_LOGD(TAG, "Processing web request: msg=%p", msg);
-  
-  if (!msg) {
-      ESP_LOGE(TAG, "Web request has NULL message handle");
-      return;
-  }
-  
-  ESP_LOGD(TAG, "Request details: req=%p, client_id=%d", msg->req, msg->client_id);
-  
-  if (!msg->req) {
-      ESP_LOGE(TAG, "Web request has NULL request handle");
-      return;
-  }
-  
-  // Get handler ID (passed in client_id field)
-  int handler_id = msg->client_id;
-  if (handler_id < 0 || handler_id >= HTTP_HANDLER_MAX || !http_handlers[handler_id].active) {
-      ESP_LOGE(TAG, "Invalid handler ID from queue: %d", handler_id);
-      httpd_resp_set_status(msg->req, "500 Internal Server Error");
-      httpd_resp_sendstr(msg->req, "Invalid handler ID");
-      httpd_req_async_handler_complete(msg->req);
-      return;
-  }
-  
-  ESP_LOGI(TAG, "Processing web request for URI: %s with handler %d", msg->req->uri, handler_id);
-  
-  // Get the Berry VM and handler function
-  bvm *handler_vm = http_handlers[handler_id].vm;
-  
-  if (handler_vm == NULL) {
-      ESP_LOGE(TAG, "Berry VM is NULL for handler %d", handler_id);
-      httpd_resp_set_status(msg->req, "500 Internal Server Error");
-      httpd_resp_sendstr(msg->req, "VM error");
-      httpd_req_async_handler_complete(msg->req);
-      return;
-  }
-  
-  ESP_LOGI(TAG, "STACK: Before pushing function, stack top = %d", be_top(handler_vm));
-  
-  // Push the function stored in the message
-  be_pushnil(handler_vm);
-  bvalue *top = be_indexof(handler_vm, -1);
-  *top = msg->func;
-  
-  current_request = msg->req;
-  
-  // Push URI as argument
-  be_pushstring(handler_vm, current_request->uri);
-  
-  // Check if this is a POST request and handle POST data
-  int arg_count = 1;  // Start with 1 for the URI
-  
-  if (current_request->method == HTTP_POST) {
-      ESP_LOGI(TAG, "Processing POST request data");
-      
-      // Get content length
-      int content_len = current_request->content_len;
-      ESP_LOGI(TAG, "POST content length: %d", content_len);
-      
-      if (content_len > 0) {
-          // Allocate buffer for POST data
-          char *post_data = malloc(content_len + 1);
-          if (post_data) {
-              // Read POST data
-              int received = httpd_req_recv(current_request, post_data, content_len);
-              if (received > 0) {
-                  // Null-terminate the data
-                  post_data[received] = '\0';
-                  ESP_LOGI(TAG, "Received POST data: %s", post_data);
-                  
-                  // Push POST data as second argument
-                  be_pushstring(handler_vm, post_data);
-                  arg_count = 2;  // Now we have 2 arguments
-              } else {
-                  ESP_LOGW(TAG, "Failed to read POST data, received: %d", received);
-                  // Push nil as second argument
-                  be_pushnil(handler_vm);
-                  arg_count = 2;
-              }
-              free(post_data);
-          } else {
-              ESP_LOGE(TAG, "Failed to allocate memory for POST data");
-              // Push nil as second argument
-              be_pushnil(handler_vm);
-              arg_count = 2;
-          }
-      } else {
-          // No content, push empty string as second argument
-          be_pushstring(handler_vm, "");
-          arg_count = 2;
-      }
-  }
-  
-  // Call the Berry function
-  int result = be_pcall(handler_vm, arg_count);
-  
-  // Log stack state after call
-  ESP_LOGI(TAG, "STACK: After be_pcall, stack top = %d, result = %d", be_top(handler_vm), result);
-  
-  // Check for errors
-  if (result != 0) {
-      const char *err_msg = be_tostring(handler_vm, -1);
-      ESP_LOGE(TAG, "Berry handler error: %s", err_msg);
-      
-      // Send error response
-      httpd_resp_set_status(msg->req, "500 Internal Server Error");
-      httpd_resp_sendstr(msg->req, (char*)err_msg);
-      
-      be_error_pop_all(handler_vm);  // Clear entire stack on error
-  } else {
-      // Get return value
-      const char *response = be_tostring(handler_vm, -1);
-      ESP_LOGI(TAG, "Request processed. Response: %s", response ? response : "(null)");
-      
-      // Send success response if httpserver.send() wasn't used
-      if (response != NULL) {
-          httpd_resp_set_type(msg->req, "text/html"); 
-          httpd_resp_sendstr(msg->req, response);
-      }
-      
-      // Pop the argument (which has been replaced by the return value)
-      be_pop(handler_vm, 1);
-  }
-  
-  // Clear current_request AFTER all processing is done
-  current_request = NULL;
-  
-  // Complete the async request - ALWAYS call this to release the request
-  httpd_req_async_handler_complete(msg->req);
-  
-  // Pop the function if we didn't encounter an error
-  if (result == 0) {
-      // Pop the function
-      be_pop(handler_vm, 1);  // Pop the function reference
-  } else {
-      ESP_LOGE(TAG, "Function parsing error: %d", result);
-  }
-  
-  // Log final stack state
-  ESP_LOGI(TAG, "STACK: Final state, stack top = %d", be_top(handler_vm));
+    ESP_LOGD(TAG, "Processing web request: msg=%p", msg);
+    
+    if (!msg) {
+        ESP_LOGE(TAG, "Web request has NULL message handle");
+        return;
+    }
+    
+    ESP_LOGD(TAG, "Request details: req=%p, client_id=%d", msg->req, msg->client_id);
+    
+    if (!msg->req) {
+        ESP_LOGE(TAG, "Web request has NULL request handle");
+        return;
+    }
+    
+    // Get handler ID (passed in client_id field)
+    int handler_id = msg->client_id;
+    if (handler_id < 0 || handler_id >= HTTP_HANDLER_MAX || !http_handlers[handler_id].active) {
+        ESP_LOGE(TAG, "Invalid handler ID from queue: %d", handler_id);
+        httpd_resp_set_status(msg->req, "500 Internal Server Error");
+        httpd_resp_sendstr(msg->req, "Invalid handler ID");
+        httpd_req_async_handler_complete(msg->req);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Processing web request for URI: %s with handler %d", msg->req->uri, handler_id);
+    
+    // Get the Berry VM and handler function
+    bvm *handler_vm = http_handlers[handler_id].vm;
+    
+    if (handler_vm == NULL) {
+        ESP_LOGE(TAG, "Berry VM is NULL for handler %d", handler_id);
+        httpd_resp_set_status(msg->req, "500 Internal Server Error");
+        httpd_resp_sendstr(msg->req, "VM error");
+        httpd_req_async_handler_complete(msg->req);
+        return;
+    }
+
+    // Save initial stack position for diagnostic logging
+    int initial_top = be_top(handler_vm);
+    
+    // Push the function stored in the message
+    be_pushnil(handler_vm);
+    bvalue *top = be_indexof(handler_vm, -1);
+    *top = msg->func;
+    
+    current_request = msg->req;
+    
+    // Push URI as argument
+    be_pushstring(handler_vm, current_request->uri);
+    
+    // Check if this is a POST request and handle POST data
+    int arg_count = 1;  // Start with 1 for the URI
+    
+    if (current_request->method == HTTP_POST) {
+        ESP_LOGI(TAG, "Processing POST request data");
+        
+        // Get content length
+        int content_len = current_request->content_len;
+        ESP_LOGI(TAG, "POST content length: %d", content_len);
+        
+        if (content_len > 0) {
+            // Allocate buffer for POST data
+            char *post_data = malloc(content_len + 1);
+            if (post_data) {
+                // Read POST data
+                int received = httpd_req_recv(current_request, post_data, content_len);
+                if (received > 0) {
+                    // Null-terminate the data
+                    post_data[received] = '\0';
+                    ESP_LOGI(TAG, "Received POST data: %s", post_data);
+                    
+                    // Push POST data as second argument
+                    be_pushstring(handler_vm, post_data);
+                    arg_count = 2;  // Now we have 2 arguments
+                } else {
+                    ESP_LOGW(TAG, "Failed to read POST data, received: %d", received);
+                    // Push nil as second argument
+                    be_pushnil(handler_vm);
+                    arg_count = 2;
+                }
+                free(post_data);
+            } else {
+                ESP_LOGE(TAG, "Failed to allocate memory for POST data");
+                // Push nil as second argument
+                be_pushnil(handler_vm);
+                arg_count = 2;
+            }
+        } else {
+            // No content, push empty string as second argument
+            be_pushstring(handler_vm, "");
+            arg_count = 2;
+        }
+    }
+    
+    // Call the Berry function
+    int result = be_pcall(handler_vm, arg_count);
+
+    if (result != 0) {
+        const char *err_msg = be_tostring(handler_vm, -1);
+        ESP_LOGE(TAG, "Berry handler error: %s", err_msg);
+        
+        // Send error response
+        httpd_resp_set_status(msg->req, "500 Internal Server Error");
+        httpd_resp_sendstr(msg->req, (char*)err_msg);
+        
+        be_error_pop_all(handler_vm);  // Clear entire stack on error
+    } else {
+        // Get return value
+        const char *response = be_tostring(handler_vm, -1);
+        
+        // Send success response if httpserver.send() wasn't used
+        if (response != NULL) {
+            httpd_resp_set_type(msg->req, "text/html"); 
+            httpd_resp_sendstr(msg->req, response);
+        }
+        
+        // Pop the argument(s)         
+        be_pop(handler_vm, arg_count);
+    }
+    
+    // Clear current_request AFTER all processing is done
+    current_request = NULL;
+    
+    // Complete the async request - ALWAYS call this to release the request
+    httpd_req_async_handler_complete(msg->req);
+    
+    // Pop the function if we didn't encounter an error
+    if (result == 0) {
+        // Pop the function
+        be_pop(handler_vm, 1);  // Pop the function reference
+    } else {
+        ESP_LOGE(TAG, "Function parsing error: %d", result);
+    }
+    
+    if (be_top(handler_vm) != initial_top) {
+        ESP_LOGE(TAG, "[STACK-ERROR] imbalance detected: %d (expected %d)", be_top(handler_vm), initial_top);
+    }
 }
 
 
@@ -558,90 +555,17 @@ static esp_err_t berry_http_handler_impl(httpd_req_t *req, int handler_id) {
         return ESP_FAIL;
     }
     
-    // Log initial stack state
-    ESP_LOGI(TAG, "HANDLER: Initial stack top = %d", be_top(vm));
-    
-    // Queue message for processing in main task if available
-    if (http_queue_initialized) {
-        ESP_LOGI(TAG, "Queueing request for %s", req->uri);
-        
-        // Queue the request with the stored function value
-        if (!httpserver_queue_web_request(handler_id, req, http_handlers[handler_id].func)) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to queue message");
-            current_request = NULL;
-            httpd_req_async_handler_complete(req);
-            return ESP_FAIL;
-        }
-        
+    // Queue the request for Berry processing with the stored function value
+    if (httpserver_queue_web_request(handler_id, req, http_handlers[handler_id].func)) {
         // Note: We don't send a response here - that will be done asynchronously
         current_request = NULL;
-        
-        // Log final stack state
-        ESP_LOGI(TAG, "HANDLER: Final stack top = %d", be_top(vm));
-        
         return ESP_OK;
-    }
-    
-    // If no queue, we'll process directly with caution
-    ESP_LOGW(TAG, "Processing request directly - this may be unsafe!");
-    
-    // Start the async handler
-    httpd_req_t *async_req = NULL;
-    esp_err_t ret = httpd_req_async_handler_begin(req, &async_req);
-    if (ret != ESP_OK || async_req == NULL) {
-        ESP_LOGE(TAG, "Failed to start async handler");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to start async handler");
+    } else {
         current_request = NULL;
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to queue message");
         httpd_req_async_handler_complete(req);
         return ESP_FAIL;
     }
-    
-    // Get the initial stack size
-    int top = be_top(vm);
-    
-    // Push the handler function directly onto the stack (copy from stored value)
-    be_pushnil(vm);  // Push a temporary placeholder 
-    bvalue *top_ptr = be_indexof(vm, -1);
-    *top_ptr = http_handlers[handler_id].func;  // Replace placeholder with stored function
-    
-    // Push the URI string (argument) onto the stack
-    be_pushstring(vm, req->uri);
-    
-    // Call the handler function with the URI as single argument
-    if (be_pcall(vm, 1) != 0) {
-        const char *err_msg = be_tostring(vm, -1);
-        ESP_LOGE(TAG, "Berry error: %s", err_msg ? err_msg : "unknown error");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Handler call failed");
-        be_error_pop_all(vm);  // Special case - clears entire stack on error
-        current_request = NULL;
-        httpd_req_async_handler_complete(req);
-        return ESP_FAIL;
-    }
-    
-    // Get the response string
-    const char *response = be_tostring(vm, -1);
-    if (response == NULL) {
-        ESP_LOGE(TAG, "Handler returned nil response");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Handler returned nil response");
-        be_error_pop_all(vm);  // Special case - clears entire stack on error
-        current_request = NULL;
-        httpd_req_async_handler_complete(req);
-        return ESP_FAIL;
-    }
-    
-    // Send the response
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req, response);
-    
-    // Clean up
-    be_pop(vm, 1);  // Pop return value
-    be_pop(vm, 1);  // Pop function
-    current_request = NULL;
-    
-    // Complete the async handler
-    httpd_req_async_handler_complete(async_req);
-    
-    return ESP_OK;
 }
 
 // ------------------------------------------------------------------------

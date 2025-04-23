@@ -738,12 +738,12 @@ static int w_wsserver_send(bvm *vm) {
     if (is_bytes) {
         // It's a bytes object - get raw length
         data = be_tobytes(vm, 2, &len);
-        ESP_LOGI(TAG, "Got bytes object with length: %d", (int)len);
+        ESP_LOGI(TAG, "Sending bytes object from Berry, length: %d", (int)len);
     } else {
         // For normal strings, get the length from Berry
         len = be_strlen(vm, 2);
         data = be_tostring(vm, 2);
-        ESP_LOGI(TAG, "Got string %s with length: %d", data, (int)len);
+        ESP_LOGI(TAG, "Sending string '%s' from Berry, length: %d", data, (int)len);
     }
     
     if (len == 0 || data == NULL) {
@@ -1045,7 +1045,7 @@ void be_wsserver_cb_deinit(bvm *vm) {
 
 // Module definition
 /* @const_object_info_begin
-module wsserver (scope: global) {
+module wsserver (scope: global, strings: weak) {
     CONNECT, int(WSSERVER_EVENT_CONNECT)
     DISCONNECT, int(WSSERVER_EVENT_DISCONNECT)
     MESSAGE, int(WSSERVER_EVENT_MESSAGE)
