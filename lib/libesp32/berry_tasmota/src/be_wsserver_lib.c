@@ -94,6 +94,8 @@ typedef struct {
     ws_client_state_t state; // Client state for WebREPL/Normal App
     char password_buffer[20]; // Buffer for password input
     uint8_t password_len;
+    char command_buffer[256]; // Buffer for accumulating REPL commands
+    uint8_t command_len;     // Current length of command in buffer
 } ws_client_t;
 
 // Callback structure to properly store Berry callbacks
@@ -143,7 +145,15 @@ static const char* webrepl_password = "password"; // CHANGE THIS!
 
 // Helper to send prompts/frames directly from C
 void send_ws_text_frame(int sockfd, const char* text) {
-    if (sockfd < 0 || !ws_server || !text) return;
+    if (sockfd < 0 || !ws_server || !text) {
+        ESP_LOGE(TAG, "Invalid parameters in send_ws_text_frame: sockfd=%d, ws_server=%p, text=%p", 
+                 sockfd, ws_server, text);
+        return;
+    }
+    
+    // Log to help debug message routing
+    ESP_LOGI(TAG, "Sending frame to socket %d: '%s'", sockfd, text);
+    
     httpd_ws_frame_t frame;
     memset(&frame, 0, sizeof(frame));
     frame.payload = (uint8_t*)text;
@@ -151,24 +161,57 @@ void send_ws_text_frame(int sockfd, const char* text) {
     frame.type = HTTPD_WS_TYPE_TEXT;
     esp_err_t ret = httpd_ws_send_frame_async(ws_server, sockfd, &frame);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to send direct frame to sockfd %d: %s", sockfd, esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to send direct frame to sockfd %d: %s (%d)", 
+                 sockfd, esp_err_to_name(ret), ret);
+    } else {
+        ESP_LOGI(TAG, "Successfully sent frame to socket %d", sockfd);
     }
 }
 
-// Placeholder for REPL execution function
-// static void execute_berry_repl_code(bvm *vm, int client_id, const char* code) {
-//     // TODO: Implement actual Berry REPL execution logic here
-//     // This might involve parsing, compiling, and executing the code string
-//     // within the Berry VM context, potentially managing REPL state.
-//     ESP_LOGI(TAG, "REPL (Client %d): Executing '%s'", client_id, code);
 
-//     // Example: Send back a simple echo or confirmation for now
-//     char response_buffer[128];
-//     snprintf(response_buffer, sizeof(response_buffer), "Executed: %s \n>>> ", code);
-//     if (ws_clients[client_id].active) {
-//         send_ws_text_frame(ws_clients[client_id].sockfd, response_buffer);
-//     }
-// }
+// Check if a client is valid and connected
+bool is_client_valid(int client_id) {
+    // Check for valid client ID range
+    if (client_id < 0 || client_id >= MAX_WS_CLIENTS) {
+        ESP_LOGE(TAG, "Invalid client ID: %d", client_id);
+        return false;
+    }
+    // Check if client is active and has a valid socket
+    if (!ws_clients[client_id].active || ws_clients[client_id].sockfd < 0) {
+        ESP_LOGE(TAG, "Client %d is not active (active=%d, sockfd=%d)",
+                client_id, ws_clients[client_id].active, ws_clients[client_id].sockfd);
+        return false;
+    }
+    
+    return true;
+}
+
+
+// New helper function to send to a specific client by ID
+void send_ws_text_frame_to_client(int client_id, const char* text) {
+    if (!is_client_valid(client_id) || !text) {
+        ESP_LOGE(TAG, "Invalid parameters in send_ws_text_frame_to_client: client_id=%d, valid=%d, text=%p", 
+                 client_id, is_client_valid(client_id), text);
+        return;
+    }
+    
+    int sockfd = ws_clients[client_id].sockfd;
+    
+    ESP_LOGI(TAG, "Sending frame to client %d (socket %d): '%s'", client_id, sockfd, text);
+    
+    httpd_ws_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.payload = (uint8_t*)text;
+    frame.len = strlen(text);
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    esp_err_t ret = httpd_ws_send_frame_async(ws_server, sockfd, &frame);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send frame to client %d (socket %d): %s (%d)", 
+                 client_id, sockfd, esp_err_to_name(ret), ret);
+    } else {
+        ESP_LOGI(TAG, "Successfully sent frame to client %d (socket %d)", client_id, sockfd);
+    }
+}
 
 // Call a Berry callback function registered by wsserver.on()
 // CONTEXT: Main Tasmota Task (Berry VM Context)
@@ -282,75 +325,304 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         ESP_LOGI(TAG, "Handling WebSocket message event in main task: client=%d, state=%d, len=%d", 
                 client_id, state, (int)len);
 
-    if (state == WS_STATE_PASSWORD) {
-        // Password input handling - check if the message is a single character or a full password
-        size_t input_len = strlen(data);
-        bool is_enter = false;
-        
-        // Check if message contains CR/LF (Enter pressed)
-        for (size_t i = 0; i < input_len; i++) {
-            if (data[i] == '\r' || data[i] == '\n') {
+        if (state == WS_STATE_PASSWORD) {
+            // Password input handling
+            bool is_enter = false;
+            bool has_password = false;
+            size_t password_length = len;
+            
+            // Check if this is just a standalone line ending
+            if ((len == 1 && (data[0] == '\r' || data[0] == '\n')) ||  // Single CR or LF
+                (len == 2 && data[0] == '\r' && data[1] == '\n')) {    // CRLF sequence
                 is_enter = true;
-                break;
             }
-        }
-        
-        if (is_enter) {
-            // Enter pressed - verify complete password
-            ESP_LOGD(TAG, "Password Enter detected for client %d (buffer len %d)", 
-                    client_id, ws_clients[client_id].password_len);
-            
-            // Compare accumulated password with the correct one
-            if (strncmp(ws_clients[client_id].password_buffer, webrepl_password, 
-                    ws_clients[client_id].password_len) == 0 && 
-                    webrepl_password[ws_clients[client_id].password_len] == '\0') {
-                // Password Correct
-                ESP_LOGI(TAG, "Client %d authenticated.", client_id);
-                ws_clients[client_id].state = WS_STATE_REPL; // Transition state
-                send_ws_text_frame(sockfd, "\r\nWebREPL connected\r\n>>> ");
-            } else {
-                // Password Incorrect
-                ESP_LOGW(TAG, "Client %d authentication failed.", client_id);
-                send_ws_text_frame(sockfd, "Wrong password\r\n");
-                
-                // Close the connection on wrong password
-                ws_clients[client_id].active = false;
-                handle_client_disconnect(client_id);
+            // Check if message ends with line ending(s)
+            else if (len > 0) {
+                // Check for message ending with LF
+                if (data[len-1] == '\n') {
+                    is_enter = true;
+                    password_length = len - 1;  // Exclude the LF
+                    has_password = true;
+                    
+                    // Also check if there's a CR before the LF
+                    if (password_length > 0 && data[password_length-1] == '\r') {
+                        password_length--;  // Exclude the CR too
+                    }
+                }
+                // Check for message ending with CR
+                else if (data[len-1] == '\r') {
+                    is_enter = true;
+                    password_length = len - 1;  // Exclude the CR
+                    has_password = true;
+                }
+                // Also treat full password without CR/LF as a complete password if:
+                // It's a long message (likely entire password) and no existing accumulated password
+                else if (len > 3 && ws_clients[client_id].password_len == 0) {
+                    // Complete password likely received at once
+                    has_password = true;
+                    password_length = len;
+                    // For password without line ending, set is_enter to true
+                    // to trigger verification below
+                    is_enter = true;
+                }
             }
             
-            // Reset buffer for next time
-            ws_clients[client_id].password_len = 0;
-            ws_clients[client_id].password_buffer[0] = '\0';
-        } else {
-            // Not Enter - accumulate password character(s)
-            size_t available_space = sizeof(ws_clients[client_id].password_buffer) - 
-                                    ws_clients[client_id].password_len - 1; // -1 for null terminator
-            
-            if (available_space > 0) {
-                // Append new character(s) to buffer
-                size_t chars_to_copy = input_len < available_space ? input_len : available_space;
-                strncat(ws_clients[client_id].password_buffer, 
-                    data, chars_to_copy);
-                ws_clients[client_id].password_len += chars_to_copy;
-                
-                // Ensure null termination
-                ws_clients[client_id].password_buffer[ws_clients[client_id].password_len] = '\0';
-                
-                ESP_LOGD(TAG, "Added %d chars to password buffer (now %d chars)", 
-                        (int)chars_to_copy, ws_clients[client_id].password_len);
-            } else {
-                // Buffer overflow - reject password
-                ESP_LOGW(TAG, "Password buffer overflow for client %d", client_id);
-                send_ws_text_frame(sockfd, "Password too long\r\n");
-                
-                // Close the connection
-                ws_clients[client_id].active = false;
-                handle_client_disconnect(client_id);
+            if (is_enter && !has_password) {
+                // Just a bare Enter/line ending - verify any accumulated password
+                if (ws_clients[client_id].password_len > 0) {
+                    // Verify password
+                    ESP_LOGD(TAG, "Verifying password for client %d (buffer len %d): '%s'", 
+                            client_id, ws_clients[client_id].password_len, ws_clients[client_id].password_buffer);
+                    
+                    // Compare accumulated password with the correct one
+                    if (strcmp(ws_clients[client_id].password_buffer, webrepl_password) == 0) {
+                        // Password Correct
+                        ESP_LOGI(TAG, "Client %d authenticated.", client_id);
+                        ws_clients[client_id].state = WS_STATE_REPL; // Transition state
+                        send_ws_text_frame(sockfd, "\r\nWebREPL connected\r\n>>> ");
+                    } else {
+                        // Password Incorrect
+                        ESP_LOGW(TAG, "Client %d authentication failed (%d chars): '%s'", 
+                                client_id, ws_clients[client_id].password_len, ws_clients[client_id].password_buffer);
+                        send_ws_text_frame(sockfd, "\r\nWrong password\r\n");
+                        
+                        // Close the connection on wrong password
+                        ws_clients[client_id].active = false;
+                        handle_client_disconnect(client_id);
+                    }
+                    
+                    // Reset buffer for next time
+                    ws_clients[client_id].password_len = 0;
+                    ws_clients[client_id].password_buffer[0] = '\0';
+                }
             }
-        }
-    } else if (state == WS_STATE_REPL) {
-            // Route to REPL executor
-            be_webrepl_execute_code(vm, client_id, data, len);
+            else if (has_password) {
+                // We have a password to process (with or without line ending)
+                size_t available_space = sizeof(ws_clients[client_id].password_buffer) - 1;
+                size_t chars_to_copy = password_length < available_space ? password_length : available_space;
+                
+                // Echo asterisks for the password chars - send as single message since full password
+                // is received at once
+                char asterisks[65] = {0};  // Max 64 asterisks + null terminator
+                size_t ast_count = chars_to_copy > 64 ? 64 : chars_to_copy;
+                for (size_t i = 0; i < ast_count; i++) {
+                    asterisks[i] = '*';
+                }
+                asterisks[ast_count] = '\0';
+                send_ws_text_frame(sockfd, asterisks);
+                
+                // Copy password to buffer
+                memcpy(ws_clients[client_id].password_buffer, data, chars_to_copy);
+                ws_clients[client_id].password_len = chars_to_copy;
+                ws_clients[client_id].password_buffer[chars_to_copy] = '\0';
+                
+                // If this ended with a line ending, verify the password now
+                if (is_enter) {
+                    // Send a newline for the Enter key
+                    send_ws_text_frame(sockfd, "\r\n");
+                    
+                    // Verify password
+                    ESP_LOGD(TAG, "Verifying password for client %d (buffer len %d): '%s'", 
+                            client_id, ws_clients[client_id].password_len, ws_clients[client_id].password_buffer);
+                    
+                    // Compare password with the correct one
+                    if (strcmp(ws_clients[client_id].password_buffer, webrepl_password) == 0) {
+                        // Password Correct
+                        ESP_LOGI(TAG, "Client %d authenticated.", client_id);
+                        ws_clients[client_id].state = WS_STATE_REPL; // Transition state
+                        send_ws_text_frame(sockfd, "WebREPL connected\r\n>>> ");
+                    } else {
+                        // Password Incorrect
+                        ESP_LOGW(TAG, "Client %d authentication failed (%d chars): '%s'", 
+                                client_id, ws_clients[client_id].password_len, ws_clients[client_id].password_buffer);
+                        send_ws_text_frame(sockfd, "Wrong password\r\n");
+                        
+                        // Close the connection on wrong password
+                        ws_clients[client_id].active = false;
+                        handle_client_disconnect(client_id);
+                    }
+                    
+                    // Reset buffer for next time
+                    ws_clients[client_id].password_len = 0;
+                    ws_clients[client_id].password_buffer[0] = '\0';
+                }
+            }
+            else {
+                // Not Enter - accumulate password character(s)
+                size_t available_space = sizeof(ws_clients[client_id].password_buffer) - 
+                                        ws_clients[client_id].password_len - 1; // -1 for null terminator
+                
+                if (available_space > 0) {
+                    // Append new character(s) to buffer
+                    size_t chars_to_copy = len < available_space ? len : available_space;
+                    strncat(ws_clients[client_id].password_buffer, 
+                        data, chars_to_copy);
+                    ws_clients[client_id].password_len += chars_to_copy;
+                    
+                    // Ensure null termination
+                    ws_clients[client_id].password_buffer[ws_clients[client_id].password_len] = '\0';
+                    
+                    // Echo '*' for each character
+                    for (size_t i = 0; i < chars_to_copy; i++) {
+                        send_ws_text_frame(sockfd, "*");
+                    }
+                    
+                    ESP_LOGD(TAG, "Added %d chars to password buffer (now %d chars)", 
+                            (int)chars_to_copy, ws_clients[client_id].password_len);
+                } else {
+                    // Buffer overflow - reject password
+                    ESP_LOGW(TAG, "Password buffer overflow for client %d", client_id);
+                    send_ws_text_frame(sockfd, "\r\nPassword too long\r\n");
+                    
+                    // Close the connection
+                    ws_clients[client_id].active = false;
+                    handle_client_disconnect(client_id);
+                }
+            }
+        } else if (state == WS_STATE_REPL) {
+            // REPL command handling
+            bool is_enter = false;
+            bool has_command = false;
+            size_t command_length = len;
+            
+            // Debug the incoming data in hex format to see control characters
+            char hex_debug[128] = {0};
+            for (size_t i = 0; i < len && i < 32; i++) {
+                snprintf(hex_debug + i*3, sizeof(hex_debug) - i*3, "%02x ", (unsigned char)data[i]);
+            }
+            ESP_LOGI(TAG, "REPL received %d bytes: [%s]", (int)len, hex_debug);
+            
+            // Check if this is just a standalone line ending
+            if ((len == 1 && (data[0] == '\r' || data[0] == '\n')) ||  // Single CR or LF
+                (len == 2 && data[0] == '\r' && data[1] == '\n')) {    // CRLF sequence
+                is_enter = true;
+                ESP_LOGI(TAG, "Detected standalone line ending");
+            }
+            // Check if message ends with line ending(s)
+            else if (len > 0) {
+                // Check for message ending with LF
+                if (data[len-1] == '\n') {
+                    is_enter = true;
+                    command_length = len - 1;  // Exclude the LF
+                    has_command = true;
+                    
+                    // Also check if there's a CR before the LF
+                    if (command_length > 0 && data[command_length-1] == '\r') {
+                        command_length--;  // Exclude the CR too
+                    }
+                    ESP_LOGI(TAG, "Detected line ending at end of message, command length: %d", command_length);
+                }
+                // Check for message ending with CR
+                else if (data[len-1] == '\r') {
+                    is_enter = true;
+                    command_length = len - 1;  // Exclude the CR
+                    has_command = true;
+                    ESP_LOGI(TAG, "Detected CR at end of message, command length: %d", command_length);
+                }
+                // For commands without line endings (full command in one message)
+                else if (len > 0 && ws_clients[client_id].command_len == 0) {
+                    // Only treat as complete command for non-WebREPL clients
+                    // WebREPL sends character by character
+                    // Check if this is a single character (likely from WebREPL)
+                    if (len == 1) {
+                        // This is likely from WebREPL - accumulate, don't execute yet
+                        has_command = false;
+                        is_enter = false;
+                        ESP_LOGI(TAG, "Single character received, accumulating");
+                    } else {
+                        has_command = true;
+                        command_length = len;
+                        is_enter = true;  // Treat as complete command
+                        ESP_LOGI(TAG, "Treating as complete command: %d bytes", command_length);
+                    }
+                }
+            }
+            
+            if (is_enter && !has_command) {
+                // Just a bare Enter/line ending, execute any existing accumulated command
+                if (ws_clients[client_id].command_len > 0) {
+                    ESP_LOGI(TAG, "Executing accumulated command: '%s' (len: %d)", 
+                             ws_clients[client_id].command_buffer, ws_clients[client_id].command_len);
+                    // Execute the accumulated command using the current client ID
+                    be_webrepl_execute_code(vm, client_id, ws_clients[client_id].command_buffer, ws_clients[client_id].command_len);
+                    // Reset buffer for next command
+                    ws_clients[client_id].command_len = 0;
+                    ws_clients[client_id].command_buffer[0] = '\0';
+                } else {
+                    // Empty command, just show prompt
+                    send_ws_text_frame(sockfd, "\r\n>>> ");
+                }
+            } 
+            else if (is_enter && has_command) {
+                // A command with line ending - process it directly
+                char cmd_debug[64] = {0};
+                strncpy(cmd_debug, data, command_length < 63 ? command_length : 63);
+                ESP_LOGI(TAG, "Processing direct command: '%s' (len: %d)", cmd_debug, command_length);
+                
+                // Echo the command first (without line endings)
+                send_ws_text_frame(sockfd, data);
+                
+                // Append to any existing accumulated command
+                size_t available_space = sizeof(ws_clients[client_id].command_buffer) - 
+                                        ws_clients[client_id].command_len - 1; // -1 for null terminator
+                
+                if (available_space >= command_length) {
+                    // Copy command (excluding line endings) to the buffer
+                    strncat(ws_clients[client_id].command_buffer, data, command_length);
+                    ws_clients[client_id].command_len += command_length;
+                    ws_clients[client_id].command_buffer[ws_clients[client_id].command_len] = '\0';
+                    
+                    ESP_LOGI(TAG, "Executing command: '%s' (len: %d)", 
+                             ws_clients[client_id].command_buffer, ws_clients[client_id].command_len);
+                    // Execute the command using the current client ID
+                    be_webrepl_execute_code(vm, client_id, ws_clients[client_id].command_buffer, ws_clients[client_id].command_len);
+                    // Reset buffer for next command
+                    ws_clients[client_id].command_len = 0;
+                    ws_clients[client_id].command_buffer[0] = '\0';
+                } 
+                else {
+                    // Command is too long, reject it
+                    ESP_LOGW(TAG, "Command buffer overflow for client %d", client_id);
+                    send_ws_text_frame(sockfd, "\r\nCommand too long\r\n>>> ");
+                    ws_clients[client_id].command_len = 0;
+                    ws_clients[client_id].command_buffer[0] = '\0';
+                }
+            }
+            else {
+                // Not Enter - accumulate command character(s)
+                // Echo the character(s) as received
+                send_ws_text_frame(sockfd, data);
+                
+                size_t available_space = sizeof(ws_clients[client_id].command_buffer) - 
+                                    ws_clients[client_id].command_len - 1; // -1 for null terminator
+                
+                if (available_space > 0) {
+                    // Append new character(s) to buffer
+                    size_t chars_to_copy = len < available_space ? len : available_space;
+                    strncat(ws_clients[client_id].command_buffer, 
+                        data, chars_to_copy);
+                    ws_clients[client_id].command_len += chars_to_copy;
+                    
+                    // Ensure null termination
+                    ws_clients[client_id].command_buffer[ws_clients[client_id].command_len] = '\0';
+                    
+                    // Show accumulated command for debugging
+                    ESP_LOGI(TAG, "Accumulated command so far: '%s' (len: %d)", 
+                           ws_clients[client_id].command_buffer, ws_clients[client_id].command_len);
+                           
+                    ESP_LOGD(TAG, "Added %d chars to command buffer (now %d chars): '%s'", 
+                            (int)chars_to_copy, ws_clients[client_id].command_len, 
+                            ws_clients[client_id].command_buffer);
+                } else {
+                    // Buffer overflow - reset command
+                    ESP_LOGW(TAG, "Command buffer overflow for client %d", client_id);
+                    send_ws_text_frame(sockfd, "\r\nCommand too long\r\n>>> ");
+                    
+                    // Reset buffer
+                    ws_clients[client_id].command_len = 0;
+                    ws_clients[client_id].command_buffer[0] = '\0';
+                }
+            }
         } else if (state == WS_STATE_NORMAL_APP) {
             // Route to normal Berry message callback
             callBerryWsDispatcher(vm, client_id, "message", data, 3);
@@ -600,8 +872,9 @@ static int add_client(int sockfd) {
         ws_clients[slot].state = WS_STATE_INIT; // Start in INIT state
         ws_clients[slot].password_len = 0;     // Reset password buffer length
         ws_clients[slot].password_buffer[0] = '\0'; // Clear password buffer
+        ws_clients[slot].command_len = 0;      // Reset command buffer length
+        ws_clients[slot].command_buffer[0] = '\0'; // Clear command buffer
         ESP_LOGI(TAG, "Added client %d (socket %d), state INIT.", slot, sockfd);
-        // DO NOT send password prompt here. Wait for Berry trigger.
         return slot;
     }
     ESP_LOGE(TAG, "No free client slots available");
@@ -625,22 +898,6 @@ static void remove_client(int slot) {
     }
 }
 
-// Check if a client is valid and connected
-bool is_client_valid(int client_id) {
-    // Check for valid client ID range
-    if (client_id < 0 || client_id >= MAX_WS_CLIENTS) {
-        ESP_LOGE(TAG, "Invalid client ID: %d", client_id);
-        return false;
-    }
-    // Check if client is active and has a valid socket
-    if (!ws_clients[client_id].active || ws_clients[client_id].sockfd < 0) {
-        ESP_LOGE(TAG, "Client %d is not active (active=%d, sockfd=%d)",
-                client_id, ws_clients[client_id].active, ws_clients[client_id].sockfd);
-        return false;
-    }
-    
-    return true;
-}
 
 // Helper functions for server start
 static bool parse_ws_start_parameters(bvm *vm, const char **path) {

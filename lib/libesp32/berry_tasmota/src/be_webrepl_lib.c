@@ -19,6 +19,10 @@
 
 #ifdef USE_BERRY_WEBREPL
 
+#ifndef LOG_LOCAL_LEVEL
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
+#endif
+
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
@@ -66,6 +70,7 @@ static const char* webrepl_password = "password"; // CHANGE THIS!
 // --- WebREPL Helper Functions ---
 
 extern void send_ws_text_frame(int sockfd, const char* text) ;
+extern void send_ws_text_frame_to_client(int client_id, const char* text);
 
 // Returns true if password was correct, false if incorrect (caller should disconnect)
 bool be_webrepl_handle_password(int client_slot, const char* received_password, size_t len) {
@@ -81,12 +86,20 @@ bool be_webrepl_handle_password(int client_slot, const char* received_password, 
     // Compare directly (ensure null termination if needed, though len is known)
     if (strncmp(received_password, webrepl_password, len) == 0 && webrepl_password[len] == '\0') {
         ESP_LOGI(TAG, "Client %d authenticated for WebREPL.", client_slot);
-        ws_clients[client_slot].state = WS_STATE_REPL; // Transition state
-        send_ws_text_frame_repl(ws_clients[client_slot].sockfd, "\r\nWebREPL connected\r\n>>> ");
+        
+        // Directly modify the client state to ensure consistency
+        ws_clients[client_slot].state = WS_STATE_REPL;
+        
+        // Debug logging to verify state
+        ESP_LOGI(TAG, "Client %d state changed to REPL (state=%d)", client_slot, ws_clients[client_slot].state);
+        
+        // Use the client ID-based function for more reliable sending
+        send_ws_text_frame_to_client(client_slot, "\r\nWebREPL connected\r\n>>> ");
         return true; // Password OK
     } else {
         ESP_LOGW(TAG, "Client %d WebREPL authentication failed.", client_slot);
-        send_ws_text_frame(ws_clients[client_slot].sockfd, "Wrong password\r\n");
+        // Use the client ID-based function 
+        send_ws_text_frame_to_client(client_slot, "Wrong password\r\n");
         return false; // Password WRONG
     }
 }
@@ -98,44 +111,77 @@ void be_webrepl_handle_binary(int client_slot, const uint8_t* data, size_t len) 
 }
 
 
-void be_webrepl_execute_code(bvm *vm, int client_id, const char* code) {
-    // Validate inputs
+void be_webrepl_execute_code(bvm *vm, int client_id, const char* code, size_t len) {
+    // Validate inputs and check client state before proceeding
     if (!vm || !code || !is_client_valid(client_id)) {
-        ESP_LOGE(TAG, "Invalid parameters in be_webrepl_execute_code");
+        ESP_LOGE(TAG, "Invalid parameters in be_webrepl_execute_code: vm=%p, code=%p, client_id=%d valid=%d", 
+                 vm, code, client_id, is_client_valid(client_id));
         return;
     }
     
-    ESP_LOGI(TAG, "REPL (Client %d): Executing '%s'", client_id, code);
+    // Double-check client is in REPL state
+    if (ws_clients[client_id].state != WS_STATE_REPL) {
+        ESP_LOGE(TAG, "Client %d is not in REPL state (state=%d, expected %d)", 
+                 client_id, ws_clients[client_id].state, WS_STATE_REPL);
+        
+        // Emergency state correction if mismatch
+        if (is_client_valid(client_id)) {
+            ESP_LOGW(TAG, "Fixing state for client %d (setting to REPL state)", client_id);
+            ws_clients[client_id].state = WS_STATE_REPL;
+        } else {
+            return; // Client not valid, can't proceed
+        }
+    }
+    
+    // Store client socket early, as client state might change during execution
+    int client_sockfd = ws_clients[client_id].sockfd;
+    
+    // Just log what we're about to execute
+    ESP_LOGI(TAG, "REPL (Client %d, socket %d): Executing %d bytes of code", 
+             client_id, client_sockfd, (int)len);
     
     // Save initial stack position
     int initial_top = be_top(vm);
     int result;
     
-    // First try to treat it as an expression by wrapping it in "return ()"
-    char *expr_code = NULL;
-    size_t expr_len = strlen(code) + 20; // Extra space for "return ()" and null terminator
-    expr_code = malloc(expr_len);
+    // Try as regular statement first (most common case)
+    ESP_LOGI(TAG, "Client %d: Attempting to load code as statement", client_id);
+    result = be_loadbuffer(vm, "webrepl", code, len);
     
-    if (expr_code) {
-        snprintf(expr_code, expr_len, "return (%s)", code);
+    // If that fails and it looks like an expression, try with "return ()"
+    if (result != BE_OK) {
+        ESP_LOGI(TAG, "Client %d: Load as statement failed, trying as expression", client_id);
+        // Pop the error from the failed attempt
+        be_pop(vm, 1);
         
-        // Try as expression first
-        result = be_loadbuffer(vm, "webrepl", expr_code, strlen(expr_code));
-        free(expr_code);
+        // Allocate buffer only if needed for expression wrapping
+        size_t expr_len = len + 10; // "return ()" + null terminator
+        char *expr = malloc(expr_len);
         
-        if (result != BE_OK) {
-            // If that fails, try as regular statement
-            be_pop(vm, 1); // Pop the error
-            result = be_loadbuffer(vm, "webrepl", code, strlen(code));
+        if (expr) {
+            // Create expression by wrapping in "return ()"
+            int written = snprintf(expr, expr_len, "return (%.*s)", (int)len, code);
+            
+            // Try again as an expression
+            if (written > 0 && written < expr_len) {
+                ESP_LOGI(TAG, "Client %d: Trying as expression: '%s'", client_id, expr);
+                result = be_loadbuffer(vm, "webrepl", expr, written);
+            }
+            
+            free(expr);
+        } else {
+            ESP_LOGE(TAG, "Client %d: Failed to allocate memory for expression", client_id);
         }
-    } else {
-        // If malloc fails, fall back to direct execution
-        result = be_loadbuffer(vm, "webrepl", code, strlen(code));
     }
     
-    // Execute the compiled code
+    // Execute the compiled code if loading succeeded
     if (result == BE_OK) {
+        ESP_LOGI(TAG, "Client %d: Code loaded successfully, executing", client_id);
         result = be_pcall(vm, 0);
+        ESP_LOGI(TAG, "Client %d: Code execution %s", client_id, 
+                result == BE_OK ? "succeeded" : "failed");
+    } else {
+        ESP_LOGE(TAG, "Client %d: Failed to load code: %d", client_id, result);
     }
     
     // Prepare response
@@ -146,23 +192,29 @@ void be_webrepl_execute_code(bvm *vm, int client_id, const char* code) {
             // We have a result value - check if it's nil
             if (be_isnil(vm, -1)) {
                 // Don't display nil values
-                snprintf(response_buffer, sizeof(response_buffer), ">>> ");
+                ESP_LOGI(TAG, "Client %d: Result is nil, sending empty result", client_id);
+                snprintf(response_buffer, sizeof(response_buffer), "\r\n>>> ");
             } else {
                 // Non-nil value, display it
                 const char *result_str = be_tostring(vm, -1);
                 if (result_str) {
-                    snprintf(response_buffer, sizeof(response_buffer), "%s\n>>> ", result_str);
+                    ESP_LOGI(TAG, "Client %d: Result value: '%s'", client_id, result_str);
+                    snprintf(response_buffer, sizeof(response_buffer), "\r\n%s\r\n>>> ", result_str);
                 } else {
-                    snprintf(response_buffer, sizeof(response_buffer), ">>> ");
+                    ESP_LOGI(TAG, "Client %d: Result conversion to string failed", client_id);
+                    snprintf(response_buffer, sizeof(response_buffer),  "\r\n>>> ");
                 }
             }
         } else {
-            snprintf(response_buffer, sizeof(response_buffer), ">>> ");
+            ESP_LOGI(TAG, "Client %d: No result value", client_id);
+            snprintf(response_buffer, sizeof(response_buffer), "\r\n>>> ");
         }
     } else {
         // Error occurred
         const char *error_str = be_tostring(vm, -1);
-        snprintf(response_buffer, sizeof(response_buffer), "Error: %s\n>>> ", 
+        ESP_LOGE(TAG, "Client %d: Execution error: %s", client_id, 
+                error_str ? error_str : "Unknown error");
+        snprintf(response_buffer, sizeof(response_buffer), "\r\nError: %s\r\n>>> ", 
                  error_str ? error_str : "Unknown error");
         be_pop(vm, 1); // Pop the error
     }
@@ -170,9 +222,37 @@ void be_webrepl_execute_code(bvm *vm, int client_id, const char* code) {
     // Reset stack to initial position
     be_pop(vm, be_top(vm) - initial_top);
     
-    // Send response back to client
-    if (ws_clients[client_id].active) {
-        send_ws_text_frame(ws_clients[client_id].sockfd, response_buffer);
+    // Send response back to client using the stored socket
+    if (client_sockfd >= 0) {
+        ESP_LOGI(TAG, "Sending response to client %d (socket %d): '%s'", 
+                client_id, client_sockfd, response_buffer);
+        
+        // Try multiple ways to ensure the message gets through
+        
+        // 1. Using the new client-based helper function
+        if (is_client_valid(client_id)) {
+            ESP_LOGI(TAG, "Client %d is valid, using send_ws_text_frame_to_client", client_id);
+            send_ws_text_frame_to_client(client_id, response_buffer);
+        } else {
+            ESP_LOGW(TAG, "Client %d is no longer valid, using direct socket approach", client_id);
+            // 2. First try direct send using the stored socket
+            send_ws_text_frame(client_sockfd, response_buffer);
+        }
+        
+        // Also check if the socket is still valid in the client array for diagnostic purposes
+        if (is_client_valid(client_id)) {
+            if (ws_clients[client_id].sockfd == client_sockfd) {
+                ESP_LOGI(TAG, "Client %d socket %d is still valid", client_id, client_sockfd);
+            } else {
+                ESP_LOGW(TAG, "Client %d socket changed from %d to %d", 
+                        client_id, client_sockfd, ws_clients[client_id].sockfd);
+            }
+        } else {
+            ESP_LOGW(TAG, "Client %d is no longer valid, but we're using saved socket %d", 
+                    client_id, client_sockfd);
+        }
+    } else {
+        ESP_LOGE(TAG, "Invalid socket for client %d, can't send response", client_id);
     }
 }
 
@@ -182,8 +262,8 @@ void be_webrepl_activate_password_mode(int client_slot) {
     ESP_LOGI(TAG, "Activating WebREPL Password Mode for client %d", client_slot);
     ws_clients[client_slot].state = WS_STATE_PASSWORD;
     ws_clients[client_slot].password_len = 0;
-    // Send the actual prompt from C
-    send_ws_text_frame(ws_clients[client_slot].sockfd, WEBREPL_PASSWORD_PROMPT);
+    // Send the actual prompt from C using client ID
+    send_ws_text_frame_to_client(client_slot, WEBREPL_PASSWORD_PROMPT);
 }
 
 
