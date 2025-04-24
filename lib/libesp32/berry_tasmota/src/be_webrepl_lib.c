@@ -35,6 +35,9 @@
 
 #define TAG "WEBREPL"
 
+// Max number of concurrent clients
+#define MAX_WS_CLIENTS 5
+
 typedef enum {
     WS_STATE_INIT,       // Just connected, before prompt/trigger check
     WS_STATE_PASSWORD,   // Sent prompt, awaiting password
@@ -50,6 +53,8 @@ typedef struct {
     ws_client_state_t state; // Client state for WebREPL/Normal App
     char password_buffer[20]; // Buffer for password input
     uint8_t password_len;
+    char command_buffer[256]; // Buffer for accumulating REPL commands - ADDED TO MATCH
+    uint8_t command_len;     // Current length of command in buffer - ADDED TO MATCH
 } ws_client_t;
 
 extern ws_client_t ws_clients[]; // Direct access or provide accessor
@@ -113,24 +118,11 @@ void be_webrepl_handle_binary(int client_slot, const uint8_t* data, size_t len) 
 
 void be_webrepl_execute_code(bvm *vm, int client_id, const char* code, size_t len) {
     // Validate inputs and check client state before proceeding
-    if (!vm || !code || !is_client_valid(client_id)) {
-        ESP_LOGE(TAG, "Invalid parameters in be_webrepl_execute_code: vm=%p, code=%p, client_id=%d valid=%d", 
-                 vm, code, client_id, is_client_valid(client_id));
+    // Rely on caller (be_wsserver_handle_message) for state checks
+    if (!vm || !code || client_id < 0 || client_id >= MAX_WS_CLIENTS) {
+        ESP_LOGE(TAG, "Invalid parameters in be_webrepl_execute_code: vm=%p, code=%p, client_id=%d", 
+                 vm, code, client_id);
         return;
-    }
-    
-    // Double-check client is in REPL state
-    if (ws_clients[client_id].state != WS_STATE_REPL) {
-        ESP_LOGE(TAG, "Client %d is not in REPL state (state=%d, expected %d)", 
-                 client_id, ws_clients[client_id].state, WS_STATE_REPL);
-        
-        // Emergency state correction if mismatch
-        if (is_client_valid(client_id)) {
-            ESP_LOGW(TAG, "Fixing state for client %d (setting to REPL state)", client_id);
-            ws_clients[client_id].state = WS_STATE_REPL;
-        } else {
-            return; // Client not valid, can't proceed
-        }
     }
     
     // Store client socket early, as client state might change during execution

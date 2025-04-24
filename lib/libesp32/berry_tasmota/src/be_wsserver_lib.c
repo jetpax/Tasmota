@@ -311,10 +311,14 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         } else {
             ESP_LOGI(TAG, "Handling WebSocket disconnect event in main task: client=%d", client_id);
             callBerryWsDispatcher(vm, client_id, "disconnect", NULL, 2);
+            
             // Reset client state on disconnect processing in main task
             ws_clients[client_id].sockfd = -1;
             ws_clients[client_id].state = WS_STATE_INIT; // Reset state
             ws_clients[client_id].password_len = 0;
+            ws_clients[client_id].command_len = 0; // Also reset command buffer
+            ws_clients[client_id].command_buffer[0] = '\0';
+            ws_clients[client_id].password_buffer[0] = '\0';
         }
     } else {
         // Normal message event with data
@@ -780,8 +784,7 @@ static void wsserver_socket_cleanup_cb(int sockfd) {
 }
 
 // Handle client disconnection
-// CONTEXT: ESP-IDF HTTP Server Task
-// Called when the server detects a client disconnection
+// CONTEXT: Can be called from HTTP Server Task or other contexts (e.g., timer)
 static void handle_client_disconnect(int client_slot) {
     if (client_slot < 0 || client_slot >= MAX_WS_CLIENTS || !ws_clients[client_slot].active) {
         // Already inactive or invalid slot
@@ -802,6 +805,9 @@ static void handle_client_disconnect(int client_slot) {
         ws_clients[client_slot].sockfd = -1;
         ws_clients[client_slot].state = WS_STATE_INIT;
         ws_clients[client_slot].password_len = 0;
+        ws_clients[client_slot].command_len = 0; // Also reset command buffer
+        ws_clients[client_slot].command_buffer[0] = '\0';
+        ws_clients[client_slot].password_buffer[0] = '\0';
     }
 }
 
