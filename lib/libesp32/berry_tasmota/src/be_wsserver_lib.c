@@ -68,15 +68,16 @@ static const char *TAG = "WSS";
 #define HTTP_MSG_FILE 2
 #define HTTP_MSG_WEB 3
 
-// Forward declaration for the HTTP server handle getter function
+// Declarations for the HTTP server functions
 extern httpd_handle_t be_httpserver_get_handle(void);
-
-// Declaration for HTTP server callback registration
-extern void httpserver_register_external_close_cb(void (*func)(int sockfd));
-
-// Declarations for functions used by httpserver_lib
 extern bool httpserver_queue_message(int msg_type, int client_id, 
                                 const void *data, size_t data_len, void *user_data);
+extern void httpserver_register_external_close_cb(void (*func)(int sockfd));
+
+// Declarations for webrepl functions
+extern void be_webrepl_execute_code(bvm *vm, int client_id, const char* code, size_t len);
+
+
 
 typedef enum {
     WS_STATE_INIT,       // Just connected, before prompt/trigger check
@@ -108,7 +109,6 @@ static int find_free_client_slot(void);
 static int add_client(int sockfd);
 static int find_client_by_fd(int sockfd);
 static void remove_client(int slot);
-static bool is_client_valid(int slot);
 static void handle_client_disconnect(int client_slot);
 static void callBerryWsDispatcher(bvm *vm, int client_id, const char *event_name, const char *payload, int arg_count);
 static void check_clients(void);
@@ -127,7 +127,7 @@ static uint32_t ping_timeout_s;   // Activity timeout in seconds
 static esp_timer_handle_t ping_timer = NULL;
 
 // Client status and context
-static ws_client_t ws_clients[MAX_WS_CLIENTS] = {0};
+ws_client_t ws_clients[MAX_WS_CLIENTS] = {0};
 
 // Storage for Berry callback functions
 static be_wsserver_callback_t wsserver_callbacks[3]; // CONNECT, DISCONNECT, MESSAGE
@@ -142,7 +142,7 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
 static const char* webrepl_password = "password"; // CHANGE THIS!
 
 // Helper to send prompts/frames directly from C
-static void send_ws_text_frame(int sockfd, const char* text) {
+void send_ws_text_frame(int sockfd, const char* text) {
     if (sockfd < 0 || !ws_server || !text) return;
     httpd_ws_frame_t frame;
     memset(&frame, 0, sizeof(frame));
@@ -156,19 +156,19 @@ static void send_ws_text_frame(int sockfd, const char* text) {
 }
 
 // Placeholder for REPL execution function
-static void execute_berry_repl_code(bvm *vm, int client_id, const char* code) {
-    // TODO: Implement actual Berry REPL execution logic here
-    // This might involve parsing, compiling, and executing the code string
-    // within the Berry VM context, potentially managing REPL state.
-    ESP_LOGI(TAG, "REPL (Client %d): Executing '%s'", client_id, code);
+// static void execute_berry_repl_code(bvm *vm, int client_id, const char* code) {
+//     // TODO: Implement actual Berry REPL execution logic here
+//     // This might involve parsing, compiling, and executing the code string
+//     // within the Berry VM context, potentially managing REPL state.
+//     ESP_LOGI(TAG, "REPL (Client %d): Executing '%s'", client_id, code);
 
-    // Example: Send back a simple echo or confirmation for now
-    char response_buffer[128];
-    snprintf(response_buffer, sizeof(response_buffer), "Executed: %s \n>>> ", code);
-    if (ws_clients[client_id].active) {
-        send_ws_text_frame(ws_clients[client_id].sockfd, response_buffer);
-    }
-}
+//     // Example: Send back a simple echo or confirmation for now
+//     char response_buffer[128];
+//     snprintf(response_buffer, sizeof(response_buffer), "Executed: %s \n>>> ", code);
+//     if (ws_clients[client_id].active) {
+//         send_ws_text_frame(ws_clients[client_id].sockfd, response_buffer);
+//     }
+// }
 
 // Call a Berry callback function registered by wsserver.on()
 // CONTEXT: Main Tasmota Task (Berry VM Context)
@@ -260,10 +260,6 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         return;
     }
 
-    if (!is_client_valid(client_id)) {
-        return;
-    }
-
     if (!data) {
         // Connect or disconnect event (no data)
         if (ws_clients[client_id].active) { // Use ws_clients state, not is_client_valid to handle disconnects correctly
@@ -286,24 +282,28 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         ESP_LOGI(TAG, "Handling WebSocket message event in main task: client=%d, state=%d, len=%d", 
                 client_id, state, (int)len);
 
-        if (state == WS_STATE_PASSWORD) {
-            // Password verification logic
-            // Clear any previous partial buffer (WebREPL expects full pw on Enter)
-            ws_clients[client_id].password_len = 0;
-            ws_clients[client_id].password_buffer[0] = '\0';
-            
-            // Check if received password matches (handle potential trailing CR/LF from client)
-            size_t compare_len = strnlen(data, sizeof(ws_clients[client_id].password_buffer) - 1);
-            
-            // Trim trailing \r or \n before comparing if clients send them
-            while (compare_len > 0 && (data[compare_len - 1] == '\r' || data[compare_len - 1] == '\n')) {
-                compare_len--;
+    if (state == WS_STATE_PASSWORD) {
+        // Password input handling - check if the message is a single character or a full password
+        size_t input_len = strlen(data);
+        bool is_enter = false;
+        
+        // Check if message contains CR/LF (Enter pressed)
+        for (size_t i = 0; i < input_len; i++) {
+            if (data[i] == '\r' || data[i] == '\n') {
+                is_enter = true;
+                break;
             }
+        }
+        
+        if (is_enter) {
+            // Enter pressed - verify complete password
+            ESP_LOGD(TAG, "Password Enter detected for client %d (buffer len %d)", 
+                    client_id, ws_clients[client_id].password_len);
             
-            ESP_LOGD(TAG, "Checking password for client %d (len %d)", client_id, compare_len);
-            
-            // Compare received (trimmed) password with the configured one
-            if (strncmp(data, webrepl_password, compare_len) == 0 && webrepl_password[compare_len] == '\0') {
+            // Compare accumulated password with the correct one
+            if (strncmp(ws_clients[client_id].password_buffer, webrepl_password, 
+                    ws_clients[client_id].password_len) == 0 && 
+                    webrepl_password[ws_clients[client_id].password_len] == '\0') {
                 // Password Correct
                 ESP_LOGI(TAG, "Client %d authenticated.", client_id);
                 ws_clients[client_id].state = WS_STATE_REPL; // Transition state
@@ -317,9 +317,40 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
                 ws_clients[client_id].active = false;
                 handle_client_disconnect(client_id);
             }
-        } else if (state == WS_STATE_REPL) {
+            
+            // Reset buffer for next time
+            ws_clients[client_id].password_len = 0;
+            ws_clients[client_id].password_buffer[0] = '\0';
+        } else {
+            // Not Enter - accumulate password character(s)
+            size_t available_space = sizeof(ws_clients[client_id].password_buffer) - 
+                                    ws_clients[client_id].password_len - 1; // -1 for null terminator
+            
+            if (available_space > 0) {
+                // Append new character(s) to buffer
+                size_t chars_to_copy = input_len < available_space ? input_len : available_space;
+                strncat(ws_clients[client_id].password_buffer, 
+                    data, chars_to_copy);
+                ws_clients[client_id].password_len += chars_to_copy;
+                
+                // Ensure null termination
+                ws_clients[client_id].password_buffer[ws_clients[client_id].password_len] = '\0';
+                
+                ESP_LOGD(TAG, "Added %d chars to password buffer (now %d chars)", 
+                        (int)chars_to_copy, ws_clients[client_id].password_len);
+            } else {
+                // Buffer overflow - reject password
+                ESP_LOGW(TAG, "Password buffer overflow for client %d", client_id);
+                send_ws_text_frame(sockfd, "Password too long\r\n");
+                
+                // Close the connection
+                ws_clients[client_id].active = false;
+                handle_client_disconnect(client_id);
+            }
+        }
+    } else if (state == WS_STATE_REPL) {
             // Route to REPL executor
-            execute_berry_repl_code(vm, client_id, data);
+            be_webrepl_execute_code(vm, client_id, data, len);
         } else if (state == WS_STATE_NORMAL_APP) {
             // Route to normal Berry message callback
             callBerryWsDispatcher(vm, client_id, "message", data, 3);
@@ -595,7 +626,7 @@ static void remove_client(int slot) {
 }
 
 // Check if a client is valid and connected
-static bool is_client_valid(int client_id) {
+bool is_client_valid(int client_id) {
     // Check for valid client ID range
     if (client_id < 0 || client_id >= MAX_WS_CLIENTS) {
         ESP_LOGE(TAG, "Invalid client ID: %d", client_id);
