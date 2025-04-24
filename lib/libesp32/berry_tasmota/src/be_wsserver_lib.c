@@ -58,8 +58,6 @@ static const char *TAG = "WSS";
 // Max number of concurrent clients
 #define MAX_WS_CLIENTS 5
 
-
-
 // Define event types
 #define WSSERVER_EVENT_CONNECT    0
 #define WSSERVER_EVENT_DISCONNECT 1
@@ -111,7 +109,6 @@ static int add_client(int sockfd);
 static int find_client_by_fd(int sockfd);
 static void remove_client(int slot);
 static bool is_client_valid(int slot);
-static void handle_ws_message(bvm* vm, int client_id, const char *message, size_t len);
 static void handle_client_disconnect(int client_slot);
 static void callBerryWsDispatcher(bvm *vm, int client_id, const char *event_name, const char *payload, int arg_count);
 static void check_clients(void);
@@ -262,10 +259,8 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         ESP_LOGE(TAG, "Berry VM is NULL in be_wsserver_handle_message");
         return;
     }
-    
-    // Validate client ID early
-    if (client_id < 0 || client_id >= MAX_WS_CLIENTS) {
-        ESP_LOGE(TAG, "Invalid client ID %d in be_wsserver_handle_message", client_id);
+
+    if (!is_client_valid(client_id)) {
         return;
     }
 
@@ -286,19 +281,53 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         // Normal message event with data
         // Check client state to route the message
         ws_client_state_t state = ws_clients[client_id].state;
+        int sockfd = ws_clients[client_id].sockfd;
 
         ESP_LOGI(TAG, "Handling WebSocket message event in main task: client=%d, state=%d, len=%d", 
                 client_id, state, (int)len);
 
-        if (state == WS_STATE_REPL) {
+        if (state == WS_STATE_PASSWORD) {
+            // Password verification logic
+            // Clear any previous partial buffer (WebREPL expects full pw on Enter)
+            ws_clients[client_id].password_len = 0;
+            ws_clients[client_id].password_buffer[0] = '\0';
+            
+            // Check if received password matches (handle potential trailing CR/LF from client)
+            size_t compare_len = strnlen(data, sizeof(ws_clients[client_id].password_buffer) - 1);
+            
+            // Trim trailing \r or \n before comparing if clients send them
+            while (compare_len > 0 && (data[compare_len - 1] == '\r' || data[compare_len - 1] == '\n')) {
+                compare_len--;
+            }
+            
+            ESP_LOGD(TAG, "Checking password for client %d (len %d)", client_id, compare_len);
+            
+            // Compare received (trimmed) password with the configured one
+            if (strncmp(data, webrepl_password, compare_len) == 0 && webrepl_password[compare_len] == '\0') {
+                // Password Correct
+                ESP_LOGI(TAG, "Client %d authenticated.", client_id);
+                ws_clients[client_id].state = WS_STATE_REPL; // Transition state
+                send_ws_text_frame(sockfd, "\r\nWebREPL connected\r\n>>> ");
+            } else {
+                // Password Incorrect
+                ESP_LOGW(TAG, "Client %d authentication failed.", client_id);
+                send_ws_text_frame(sockfd, "Wrong password\r\n");
+                
+                // Close the connection on wrong password
+                ws_clients[client_id].active = false;
+                handle_client_disconnect(client_id);
+            }
+        } else if (state == WS_STATE_REPL) {
             // Route to REPL executor
             execute_berry_repl_code(vm, client_id, data);
         } else if (state == WS_STATE_NORMAL_APP) {
             // Route to normal Berry message callback
             callBerryWsDispatcher(vm, client_id, "message", data, 3);
-        } else {
-            // Should not happen for messages (INIT/PASSWORD handled in ws_handler)
-            ESP_LOGW(TAG, "Received message for client %d in unexpected state %d", client_id, state);
+        } else if (state == WS_STATE_INIT) {
+            // Handle unexpected message in INIT state
+            ESP_LOGW(TAG, "Received unexpected message from client %d in INIT state, switching to NORMAL_APP", client_id);
+            ws_clients[client_id].state = WS_STATE_NORMAL_APP;
+            callBerryWsDispatcher(vm, client_id, "message", data, 3);
         }
     }
 }
@@ -406,11 +435,6 @@ static esp_err_t ws_handler(httpd_req_t *req) {
             handle_client_disconnect(client_slot); // Disconnect on receive error
             return ret;
         }
-        
-        // Ensure null-termination for text frames
-        if (ws_pkt.type == HTTPD_WS_TYPE_TEXT) {
-            buf[ws_pkt.len] = 0; // Null-terminate
-        }
     } else {
         // Empty data frame, nothing to process further
         // Still update activity time (done above)
@@ -418,113 +442,24 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         return ESP_OK; // Successfully handled empty frame
     }
 
-    // Message received successfully, process based on client state and frame type
-    ws_client_state_t current_state = ws_clients[client_slot].state;
-    
+    // new ws message received successfully
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT) {
-        // buf is guaranteed to be non-NULL if ws_pkt.len > 0
         const char* text_payload = (const char*)buf;
-        ESP_LOGI(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, current_state, ws_pkt.len, text_payload ? text_payload : "");
-
-        if (current_state == WS_STATE_PASSWORD) {
-            // Clear any previous partial buffer (WebREPL expects full pw on Enter)
-             ws_clients[client_slot].password_len = 0;
-             ws_clients[client_slot].password_buffer[0] = '\0';
-
-            // Check if received password matches (handle potential trailing CR/LF from client)
-            // We compare the received payload directly, up to buffer size limit.
-            size_t compare_len = strnlen(text_payload, sizeof(ws_clients[client_slot].password_buffer) - 1);
-
-            // Optional: Trim trailing \r or \n before comparing if clients send them
-            while (compare_len > 0 && (text_payload[compare_len - 1] == '\r' || text_payload[compare_len - 1] == '\n')) {
-                compare_len--;
-            }
-
-            ESP_LOGD(TAG, "Checking password for client %d (len %d)", client_slot, compare_len);
-
-            // Compare received (trimmed) password with the configured one
-            if (strncmp(text_payload, webrepl_password, compare_len) == 0 && webrepl_password[compare_len] == '\0') {
-                 // --- Password Correct ---
-                 ESP_LOGI(TAG, "Client %d authenticated.", client_slot);
-                 ws_clients[client_slot].state = WS_STATE_REPL; // Transition state
-                 send_ws_text_frame(sockfd, "\r\nWebREPL connected\r\n>>> ");
-            } else {
-                 // --- Password Incorrect ---
-                 ESP_LOGW(TAG, "Client %d authentication failed.", client_slot);
-                 send_ws_text_frame(sockfd, "Wrong password\r\n");
-                 // Close the connection immediately on wrong password
-                 // Setting active=false allows disconnect event to process cleanly later if needed
-                 ws_clients[client_slot].active = false;
-                 // No need to call handle_client_disconnect here, httpd will close socket
-                 // after we return ESP_FAIL or ESP_OK but don't continue.
-                 // Let's trigger the disconnect event queuing though for consistency.
-                 handle_client_disconnect(client_slot);
-                 ret = ESP_FAIL; // Signal error to potentially close socket
-            }
-        } else if (current_state == WS_STATE_REPL || current_state == WS_STATE_NORMAL_APP) {
-            // --- REPL Command or Normal App Message ---
-            // Pass to handle_ws_message which queues it for main task processing
-            handle_ws_message(NULL, client_slot, text_payload, ws_pkt.len); // Pass original length
-        } else { // WS_STATE_INIT
-            // Should not receive text messages in INIT state before Berry sends prompt trigger
-             ESP_LOGW(TAG, "Received unexpected TEXT message from client %d in INIT state: %s", client_slot, text_payload);
-             // Transition to normal app? Or disconnect? Assume normal app for now.
-             ws_clients[client_slot].state = WS_STATE_NORMAL_APP;
-             handle_ws_message(NULL, client_slot, text_payload, ws_pkt.len);
+        ESP_LOGI(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].state, ws_pkt.len, text_payload ? text_payload : "");
+                
+        // Queue the message - httpserver_queue_message will make its own copy
+        if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, text_payload, ws_pkt.len, NULL)) {
+            ESP_LOGE(TAG, "WS Q message failed!");
         }
-        
     } else if (ws_pkt.type == HTTPD_WS_TYPE_BINARY) {
-        ESP_LOGI(TAG, "Client %d (State:%d) Received BINARY, len=%d", client_slot, current_state, ws_pkt.len);
-        
-        // Generally, binary data shouldn't arrive during PASSWORD state.
-        // If it does, treat as an error or ignore? Disconnect seems safest.
-        if (current_state == WS_STATE_PASSWORD) {
-             ESP_LOGW(TAG, "Received unexpected BINARY message from client %d in PASSWORD state. Disconnecting.", client_slot);
-             handle_client_disconnect(client_slot);
-        } else if (current_state == WS_STATE_REPL) {
-             // WebREPL usually uses text, but maybe handle binary if needed in future?
-             // For now, ignore or log error for REPL state.
-             ESP_LOGW(TAG, "Received unexpected BINARY message from client %d in REPL state. Ignoring.", client_slot);
-             // Optionally send an error message back?
-             // send_ws_text_frame(sockfd, "Error: Binary data not expected in REPL\r\n>>> ");
-        } else { // INIT or NORMAL_APP
-            // Pass binary messages to normal handler if state allows
-            handle_ws_message(NULL, client_slot, (char*)buf, ws_pkt.len);
-        }
+        ESP_LOGI(TAG, "Client %d (State:%d) Received BINARY, len=%d", client_slot, ws_clients[client_slot].state, ws_pkt.len);
+        // TODO: Handle binary messages
     }
     
     // Free the allocated buffer
     free(buf);
     
     return ESP_OK;
-}
-
-// Handle a WebSocket message from a client (queues for main task)
-// CONTEXT: ESP-IDF HTTP Server Task
-// NOTE: vm is passed as NULL here, retrieved later in be_wsserver_handle_message
-void handle_ws_message(bvm* vm /* unused here */, int client_id, const char *message, size_t len) {
-    if (!message || len == 0) {
-        ESP_LOGE(TAG, "Received empty message from client %d", client_id);
-        return;
-    }
-    
-    // Update activity timestamp
-    if (client_id >= 0 && client_id < MAX_WS_CLIENTS && ws_clients[client_id].active) {
-        ws_clients[client_id].last_activity = esp_timer_get_time() / 1000;
-    }
-
-    // Make a copy of the message data for the queue
-    char *data_copy = calloc(1, len + 1);
-    if (!data_copy) {
-        ESP_LOGE(TAG, "Failed to allocate memory for message copy");
-        return;
-    }
-    memcpy(data_copy, message, len);
-    // Queue the message
-    if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_id, data_copy, len, NULL)) {
-        ESP_LOGE(TAG, "WS Q message failed!");
-        free(data_copy);
-    }
 }
 
 // WebSocket socket cleanup callback for HTTP server
@@ -556,10 +491,14 @@ static void handle_client_disconnect(int client_slot) {
     // Mark client as inactive BEFORE queuing the event
     ws_clients[client_slot].active = false;
 
+    // Queue the disconnect event for VM context processing
+    // The VM context handler will reset state and call callbacks
     if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, NULL, 0, NULL)) {
-        ESP_LOGE(TAG, "WS Q HTTPdisconnect failed!");
+        ESP_LOGE(TAG, "WS Q disconnect failed!");
         // Ensure cleanup happens if queuing fails
         ws_clients[client_slot].sockfd = -1;
+        ws_clients[client_slot].state = WS_STATE_INIT;
+        ws_clients[client_slot].password_len = 0;
     }
 }
 
