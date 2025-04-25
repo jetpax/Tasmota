@@ -74,17 +74,15 @@ extern bool httpserver_queue_message(int msg_type, int client_id,
                                 const void *data, size_t data_len, void *user_data);
 extern void httpserver_register_external_close_cb(void (*func)(int sockfd));
 
-// Declarations for webrepl functions
-// Renamed function
-extern void be_webrepl_handle_input(bvm *vm, int client_id, const char* code, size_t len);
 
+extern void be_webrepl_handle_input(bvm *vm, int client_id, const char* code, size_t len);
 
 
 typedef enum {
     WS_STATE_INIT,       // Just connected, before prompt/trigger check
     WS_STATE_PASSWORD,   // Sent prompt, awaiting password
-    WS_STATE_REPL,       // Password OK, processing REPL commands
-    WS_STATE_NORMAL_APP  // Determined not to be REPL
+    WS_STATE_REPL,       // Password OK, processing WebREPL commands
+    WS_STATE_NORMAL_APP  // Determined not to be WebREPL
 } ws_client_state_t;
 
 // Client tracking structure
@@ -93,9 +91,9 @@ typedef struct {
     bool active;
     int64_t last_activity;  // Timestamp of any client activity in milliseconds
     ws_client_state_t state; // Client state for WebREPL/Normal App
-    char command_buffer[256]; // Buffer for accumulating REPL commands
+    char command_buffer[256]; // Buffer for accumulating WebREPL commands
     uint8_t command_len;     // Current length of command in buffer
-    bool raw_repl_mode;      // Flag for RAW REPL mode
+    bool raw_repl_mode;      // Flag for RAW WebREPL mode
 } ws_client_t;
 
 // Callback structure to properly store Berry callbacks
@@ -346,7 +344,7 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
             // Client sent data before authentication was completed by Berry.
             // Pass it to the Berry message handler to decide what to do 
             // (e.g., ignore, buffer, treat as password attempt if prompt was sent).
-            // DO NOT change state here; Berry controls the REPL transition.
+            // DO NOT change state here; Berry controls the WebREPL transition.
             ESP_LOGI(TAG, "Message received from client %d in INIT state; passing to Berry callback.", client_id);
             callBerryWsDispatcher(vm, client_id, "message", data, 3);
         }
@@ -1073,22 +1071,12 @@ static int w_wsserver_set_repl_mode(bvm *vm) {
                          is_repl ? "REPL" : "Normal App", 
                          old_state, new_state);
                  ws_clients[client_id].state = new_state;
-                 ws_clients[client_id].raw_repl_mode = false; // Always start REPL in friendly mode
+                 ws_clients[client_id].raw_repl_mode = false; // Always start WebREPL in friendly mode
                  
                  // If entering REPL, clear any old command buffer
                  if (is_repl) {
                      ws_clients[client_id].command_len = 0;
                      ws_clients[client_id].command_buffer[0] = '\0';
-                 }
-                 
-                 // ===> ADDED: Send initial prompt on entering WebREPL <===
-                 if (is_repl) { 
-                     int sockfd = ws_clients[client_id].sockfd;
-                     if (sockfd >= 0) {
-                         // Send the connection message and initial prompt
-                         send_ws_text_frame(sockfd, "\r\nWebREPL connected\r\n>>> ");
-                         ESP_LOGI(TAG, "Sent initial REPL prompt to client %d (socket %d)", client_id, sockfd);
-                     }
                  }
                  success = true;
             } else {
