@@ -76,7 +76,7 @@ extern void httpserver_register_external_close_cb(void (*func)(int sockfd));
 
 
 extern void be_webrepl_handle_input(bvm *vm, int client_id, const char* code, size_t len);
-
+extern void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_t len);
 
 typedef enum {
     WS_STATE_INIT,       // Just connected, before prompt/trigger check
@@ -94,6 +94,18 @@ typedef struct {
     char command_buffer[256]; // Buffer for accumulating WebREPL commands
     uint8_t command_len;     // Current length of command in buffer
     bool raw_repl_mode;      // Flag for RAW WebREPL mode
+
+    // State for WebREPL binary operations (mirroring webrepl_lib.c)
+    struct webrepl_binop_state_t_tag { // Define inline struct to avoid direct include
+        bool active;
+        uint8_t _hdr_placeholder[20]; // Placeholder for hdr (avoid needing webrepl_binhdr_t)
+        uint32_t hdr_bytes_received;
+        uint32_t data_bytes_expected;
+        uint32_t data_bytes_received;
+        void *fp; // Use void* to avoid FILE* dependency here
+        char filename[128];
+    } binop;
+
 } ws_client_t;
 
 // Callback structure to properly store Berry callbacks
@@ -318,6 +330,16 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
             ESP_LOGW(TAG, "Main Task Handler: Resetting state for disconnected client %d (current state: %d, sockfd: %d)", 
                      client_id, ws_clients[client_id].state, ws_clients[client_id].sockfd);
                      
+            // Clean up any active binary operation
+            if (ws_clients[client_id].binop.active) {
+                ESP_LOGW(TAG, "Main Task Handler: Cleaning up active binary op for client %d", client_id);
+                if (ws_clients[client_id].binop.fp != NULL) {
+                    fclose((FILE*)ws_clients[client_id].binop.fp); // Cast back to FILE*
+                    ws_clients[client_id].binop.fp = NULL;
+                }
+                ws_clients[client_id].binop.active = false;
+            }
+            
             ws_clients[client_id].sockfd = -1;
             ws_clients[client_id].state = WS_STATE_INIT; // Reset state
             ws_clients[client_id].command_len = 0; // Also reset command buffer
@@ -328,13 +350,19 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         // Check client state to route the message
         ws_client_state_t state = ws_clients[client_id].state;
         int sockfd = ws_clients[client_id].sockfd;
+        bool is_binary_op = (bool)data; // Check if this was queued as binary
 
-        ESP_LOGI(TAG, "Handling WebSocket message event in main task: client=%d, state=%d, len=%d", 
-                client_id, state, (int)len);
+        ESP_LOGI(TAG, "Handling WebSocket message event in main task: client=%d, state=%d, len=%d, is_binary=%d", 
+                client_id, state, (int)len, is_binary_op);
 
-        if (state == WS_STATE_REPL) {
+        if (state == WS_STATE_REPL && is_binary_op) {
+            // REPL binary file operation
+            ESP_LOGD(TAG, "Routing BINARY message for client %d (socket %d, len %d) to WebREPL binary handler", 
+                     client_id, sockfd, (int)len);
+            be_webrepl_handle_binary(vm, client_id, (const uint8_t*)data, len);
+        } else if (state == WS_STATE_REPL) {
             // REPL command handling is now delegated to be_webrepl_handle_input
-            ESP_LOGD(TAG, "Routing message for client %d (socket %d, len %d) to WebREPL handler", 
+            ESP_LOGD(TAG, "Routing TEXT message for client %d (socket %d, len %d) to WebREPL input handler", 
                      client_id, sockfd, (int)len);
             be_webrepl_handle_input(vm, client_id, data, len);
         } else if (state == WS_STATE_NORMAL_APP) {
@@ -464,15 +492,18 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     // new ws message received successfully
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT) {
         const char* text_payload = (const char*)buf;
-        ESP_LOGI(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].state, ws_pkt.len, text_payload ? text_payload : "");
+        ESP_LOGD(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].state, ws_pkt.len, text_payload ? text_payload : "");
                 
         // Queue the message - httpserver_queue_message will make its own copy
         if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, text_payload, ws_pkt.len, NULL)) {
             ESP_LOGE(TAG, "WS Q message failed!");
         }
     } else if (ws_pkt.type == HTTPD_WS_TYPE_BINARY) {
-        ESP_LOGI(TAG, "Client %d (State:%d) Received BINARY, len=%d", client_slot, ws_clients[client_slot].state, ws_pkt.len);
-        // TODO: Handle binary messages
+        ESP_LOGD(TAG, "Client %d (State:%d) Received BINARY, len=%d", client_slot, ws_clients[client_slot].state, ws_pkt.len);
+        // Queue the message - use user_data=1 to signal it's binary
+        if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, buf, ws_pkt.len, (void*)1)) {
+            ESP_LOGE(TAG, "WS Q binary message failed!");
+        }
     }
     
     // Free the allocated buffer
@@ -522,6 +553,18 @@ static void handle_client_disconnect(int client_slot) {
         ws_clients[client_slot].state = WS_STATE_INIT;
         ws_clients[client_slot].command_len = 0; // Also reset command buffer
         ws_clients[client_slot].command_buffer[0] = '\0';
+    }
+
+    // Clean up any active binary operation state BEFORE clearing the slot
+    if (ws_clients[client_slot].binop.active) {
+        ESP_LOGW(TAG, "Disconnect Handler: Cleaning up active binary op for client %d", client_slot);
+        if (ws_clients[client_slot].binop.fp != NULL) {
+            // Need to ensure the file pointer is closed properly.
+            // Since FILE* is opaque, we need to call fclose. Requires <stdio.h> if not already included.
+            fclose((FILE*)ws_clients[client_slot].binop.fp); // Cast back to FILE*
+            ws_clients[client_slot].binop.fp = NULL;
+        }
+        ws_clients[client_slot].binop.active = false;
     }
 }
 
@@ -593,6 +636,7 @@ static int add_client(int sockfd) {
         ws_clients[slot].command_len = 0;      // Reset command buffer length
         ws_clients[slot].command_buffer[0] = '\0'; // Clear command buffer
         ws_clients[slot].raw_repl_mode = false; // Reset raw_repl_mode
+        memset(&ws_clients[slot].binop, 0, sizeof(ws_clients[slot].binop)); // Initialize binary op state
         ESP_LOGI(TAG, "Added client %d (socket %d), state INIT.", slot, sockfd);
         return slot;
     }

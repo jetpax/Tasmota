@@ -29,6 +29,7 @@
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "freertos/FreeRTOS.h" // If using queues specific to REPL
+#include <stdio.h> // For FILE*, fopen, etc.
 
 #include "be_vm.h"
 #include "be_exec.h"
@@ -37,6 +38,36 @@
 
 // Max number of concurrent clients
 #define MAX_WS_CLIENTS 5
+
+// --- BEGIN ADDED Binary Protocol definitions ---
+// Mirroring MicroPython's WebREPL binary protocol header
+typedef struct __attribute__((packed)) { // Use packed to match potential uPy layout
+    char sig[2];        // Should be 'W', 'A'
+    uint8_t op;         // 1=PUT_FILE, 2=GET_FILE
+    uint8_t flags;      // Currently unused?
+    uint64_t offset;    // File offset for PUT/GET (Little Endian)
+    uint32_t size;      // File size for PUT (Little Endian)
+    uint16_t fname_len; // Length of filename (Little Endian)
+    // Filename follows immediately
+} webrepl_binhdr_t;
+
+#define WEBREPL_HDR_SIG "WA"
+#define WEBREPL_OP_PUT_FILE 1
+#define WEBREPL_OP_GET_FILE 2
+#define WEBREPL_RESP_OK 0
+#define WEBREPL_RESP_ERROR 1
+
+// State for an ongoing binary operation for a specific client
+typedef struct {
+    bool active; // Is a binary operation in progress?
+    webrepl_binhdr_t hdr;
+    uint32_t hdr_bytes_received;
+    uint32_t data_bytes_expected; // Filename len OR file size
+    uint32_t data_bytes_received;
+    FILE *fp;
+    char filename[128]; // Max filename length + safety margin
+} webrepl_binop_state_t;
+// --- END ADDED Binary Protocol definitions ---
 
 typedef enum {
     WS_STATE_INIT,       // Just connected, before prompt/trigger check
@@ -54,6 +85,7 @@ typedef struct {
     char command_buffer[256]; // Buffer for accumulating REPL commands
     uint8_t command_len;     // Current length of command in buffer
     bool raw_repl_mode;      // Flag for RAW REPL mode
+    webrepl_binop_state_t binop; // <<< ADDED
 } ws_client_t;
 
 extern ws_client_t ws_clients[]; // Direct access or provide accessor
@@ -76,11 +108,292 @@ static const char* webrepl_password = "password"; // CHANGE THIS!
 extern void send_ws_text_frame(int sockfd, const char* text) ;
 extern void send_ws_text_frame_to_client(int client_id, const char* text);
 
-// Called when ws_handler receives BINARY (Phase 2 - File Ops)
-void be_webrepl_handle_binary(int client_slot, const uint8_t* data, size_t len) {
-     ESP_LOGW(TAG, "Received unexpected BINARY message for client %d in REPL phase 1. Ignoring.", client_slot);
-     // TODO: Implement file operations based on MicroPython binary protocol
+// --- BEGIN ADDED Binary Handling Functions ---
+
+// Helper to send binary responses (status codes)
+static void webrepl_send_bin_resp(int client_id, uint16_t code) {
+    if (!is_client_valid(client_id)) return;
+    int sockfd = ws_clients[client_id].sockfd;
+    if (sockfd < 0) return;
+
+    // Response is WB + 16-bit code (Little Endian)
+    char buf[4] = {'W', 'B', (uint8_t)(code & 0xFF), (uint8_t)(code >> 8)};
+
+    httpd_ws_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.payload = (uint8_t*)buf;
+    frame.len = sizeof(buf);
+    frame.type = HTTPD_WS_TYPE_BINARY;
+    esp_err_t ret = httpd_ws_send_frame_async(ws_server, sockfd, &frame);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send bin response %d to client %d: %s", code, client_id, esp_err_to_name(ret));
+    } else {
+        ESP_LOGD(TAG, "Sent bin response %d to client %d", code, client_id);
+    }
 }
+
+// Helper function to send file chunk for GET requests
+static bool webrepl_send_file_chunk(int client_id) {
+     if (!is_client_valid(client_id)) return false;
+     webrepl_binop_state_t *op_state = &ws_clients[client_id].binop;
+     if (!op_state->active || op_state->fp == NULL || op_state->hdr.op != WEBREPL_OP_GET_FILE) return false;
+
+     int sockfd = ws_clients[client_id].sockfd;
+     FILE *fp = op_state->fp;
+     uint8_t chunk_buf[256 + 2]; // Max chunk size + 2 bytes length prefix
+     size_t bytes_read;
+
+     // Protect against reading past intended size if specified (though GET usually doesn't specify size)
+     uint32_t max_read = 256;
+     // if (op_state->hdr.size > 0 && op_state->data_bytes_received + max_read > op_state->hdr.size) {
+     //     max_read = op_state->hdr.size - op_state->data_bytes_received;
+     // }
+
+     if (max_read == 0) { // Should not happen unless size was 0?
+         bytes_read = 0;
+     } else {
+        bytes_read = fread(chunk_buf + 2, 1, max_read, fp);
+     }
+
+     ESP_LOGD(TAG,"GET File: Read %d bytes from '%s'", (int)bytes_read, op_state->filename);
+
+     // Check for read error or end of file
+     if (bytes_read == 0) {
+         if (ferror(fp)) {
+             ESP_LOGE(TAG, "Error reading file '%s' for GET client %d", op_state->filename, client_id);
+             webrepl_send_bin_resp(client_id, WEBREPL_RESP_ERROR);
+         } else {
+             ESP_LOGI(TAG, "Finished sending GET file '%s' to client %d", op_state->filename, client_id);
+             webrepl_send_bin_resp(client_id, WEBREPL_RESP_OK); // Final OK
+         }
+         fclose(fp);
+         op_state->fp = NULL;
+         op_state->active = false; // Operation finished
+         return false; // Indicate finished
+     }
+
+     // Prepend chunk length (Little Endian)
+     chunk_buf[0] = (uint8_t)(bytes_read & 0xFF);
+     chunk_buf[1] = (uint8_t)(bytes_read >> 8);
+
+     ESP_LOGD(TAG, "Sending %d bytes file chunk to client %d", bytes_read, client_id);
+     httpd_ws_frame_t frame;
+     memset(&frame, 0, sizeof(frame));
+     frame.payload = chunk_buf;
+     frame.len = bytes_read + 2; // Length prefix + data
+     frame.type = HTTPD_WS_TYPE_BINARY;
+
+     esp_err_t ret = httpd_ws_send_frame_async(ws_server, sockfd, &frame);
+     if (ret != ESP_OK) {
+         ESP_LOGE(TAG, "Failed to send file chunk to client %d: %s", client_id, esp_err_to_name(ret));
+         fclose(fp);
+         op_state->fp = NULL;
+         op_state->active = false; // Operation failed
+         // Don't send another response here, error already logged
+         return false;
+     }
+
+     op_state->data_bytes_received += bytes_read; // Track bytes sent for GET
+     return true; // Chunk sent, more expected
+}
+
+// Called when ws_handler receives BINARY
+// Process incoming binary data (called from main task handler)
+void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_t len) {
+    if (!is_client_valid(client_id)) return;
+
+    webrepl_binop_state_t *op_state = &ws_clients[client_id].binop;
+    const uint8_t* p_data = data;
+    size_t remaining_len = len;
+
+    ESP_LOGD(TAG, "Binary Handle: Client %d, len %d, OpActive: %d, HdrRec: %u, DataRec: %u, DataExp: %u",
+            client_id, (int)len, op_state->active, op_state->hdr_bytes_received,
+            op_state->data_bytes_received, op_state->data_bytes_expected);
+
+    // --- 1. Start new operation or continue existing ---
+    if (!op_state->active) {
+        // Expecting header for a new operation
+        memset(op_state, 0, sizeof(webrepl_binop_state_t)); // Reset state
+        op_state->active = true;
+        op_state->hdr_bytes_received = 0;
+        op_state->data_bytes_received = 0;
+        op_state->data_bytes_expected = 0; // Set later
+        op_state->fp = NULL;
+        ESP_LOGD(TAG,"Binary Handle: Client %d starting new binary op.", client_id);
+    }
+
+    // --- 2. Receive Header ---
+    if (op_state->hdr_bytes_received < sizeof(webrepl_binhdr_t)) {
+        size_t needed = sizeof(webrepl_binhdr_t) - op_state->hdr_bytes_received;
+        size_t to_copy = (remaining_len < needed) ? remaining_len : needed;
+        memcpy((uint8_t*)&op_state->hdr + op_state->hdr_bytes_received, p_data, to_copy);
+        op_state->hdr_bytes_received += to_copy;
+        p_data += to_copy;
+        remaining_len -= to_copy;
+
+        // Header complete?
+        if (op_state->hdr_bytes_received == sizeof(webrepl_binhdr_t)) {
+             // Validate Signature
+             if (strncmp(op_state->hdr.sig, WEBREPL_HDR_SIG, 2) != 0) {
+                 ESP_LOGE(TAG, "Client %d: Invalid bin op signature: %c%c", client_id, op_state->hdr.sig[0], op_state->hdr.sig[1]);
+                 op_state->active = false; // Abort op
+                 // Consider closing connection?
+                 return;
+             }
+             // Validate Filename Length
+             if (op_state->hdr.fname_len >= sizeof(op_state->filename)) {
+                  ESP_LOGE(TAG, "Client %d: Filename too long (%u)", client_id, op_state->hdr.fname_len);
+                  op_state->active = false; // Abort op
+                  return;
+             }
+             ESP_LOGD(TAG, "Binary Handle: Client %d Header received. Op: %d, FNL:%u, Size:%u",
+                      client_id, op_state->hdr.op, op_state->hdr.fname_len, op_state->hdr.size);
+             op_state->data_bytes_expected = op_state->hdr.fname_len; // Now expect filename
+             op_state->data_bytes_received = 0;
+             op_state->filename[0] = ' ';
+        }
+    }
+
+    // --- 3. Receive Filename ---
+    if (op_state->hdr_bytes_received == sizeof(webrepl_binhdr_t) &&
+        op_state->data_bytes_expected == op_state->hdr.fname_len && // Expecting filename
+        op_state->data_bytes_received < op_state->data_bytes_expected) {
+
+        size_t needed = op_state->data_bytes_expected - op_state->data_bytes_received;
+        size_t to_copy = (remaining_len < needed) ? remaining_len : needed;
+        memcpy(op_state->filename + op_state->data_bytes_received, p_data, to_copy);
+        op_state->data_bytes_received += to_copy;
+        p_data += to_copy;
+        remaining_len -= to_copy;
+
+        // Filename complete?
+        if (op_state->data_bytes_received == op_state->data_bytes_expected) {
+            op_state->filename[op_state->data_bytes_received] = ' '; // Terminate filename
+            ESP_LOGI(TAG, "Binary Handle: Client %d Op %d, Filename '%s' received.", client_id, op_state->hdr.op, op_state->filename);
+
+            // --- Prepare for File Data or Action ---
+            bool op_ok = false;
+            const char* file_mode = NULL;
+            // TODO: Sanitize filename - VERY IMPORTANT
+            // e.g., check for '/', '..', non-printable chars
+
+            if (op_state->hdr.op == WEBREPL_OP_PUT_FILE) {
+                file_mode = "wb";
+                // TODO: Handle offset with "r+b" or "ab"? fopen("wb") truncates.
+                // Micropython WebREPL PUT seems to always truncate/overwrite.
+            } else if (op_state->hdr.op == WEBREPL_OP_GET_FILE) {
+                file_mode = "rb";
+            }
+
+            if (file_mode) {
+                // IMPORTANT: Assume files are relative to a base path, e.g., "/"
+                char full_path[sizeof(op_state->filename) + 10]; 
+                snprintf(full_path, sizeof(full_path), "/%s", op_state->filename); 
+                // TODO: Add better path sanitation (e.g., disallow '..')
+                
+                op_state->fp = fopen(full_path, file_mode);
+                if (op_state->fp) {
+                    op_ok = true;
+                    ESP_LOGI(TAG,"Opened '%s' (%s) for client %d", full_path, file_mode, client_id);
+                    // TODO: Handle fseek for offset if needed
+                } else {
+                    ESP_LOGE(TAG, "Failed to open '%s' (%s) for client %d", full_path, file_mode, client_id);
+                }
+            } else {
+                 ESP_LOGW(TAG, "Client %d: Unsupported binary op: %d", client_id, op_state->hdr.op);
+                 // Treat as error for now
+            }
+
+            // Send initial response
+            webrepl_send_bin_resp(client_id, op_ok ? WEBREPL_RESP_OK : WEBREPL_RESP_ERROR);
+
+            if (!op_ok) {
+                op_state->active = false; // Abort failed op
+            } else {
+                // Setup for next data phase
+                if (op_state->hdr.op == WEBREPL_OP_PUT_FILE) {
+                    op_state->data_bytes_expected = op_state->hdr.size; // Now expect file content
+                    op_state->data_bytes_received = 0;
+                    ESP_LOGD(TAG,"Expecting %u bytes for PUT '%s'", op_state->data_bytes_expected, op_state->filename);
+                } else if (op_state->hdr.op == WEBREPL_OP_GET_FILE) {
+                    op_state->data_bytes_expected = 0; // Not expecting client data
+                    op_state->data_bytes_received = 0; // Will track bytes *sent*
+                    ESP_LOGD(TAG,"Starting send for GET '%s'", op_state->filename);
+                    if (!webrepl_send_file_chunk(client_id)) {
+                        // File send finished immediately or failed
+                        // State already cleaned up by helper
+                    }
+                }
+            }
+        }
+    }
+
+    // --- 4. Receive/Process File Data (PUT) ---
+    if (op_state->active &&
+        op_state->hdr_bytes_received == sizeof(webrepl_binhdr_t) &&
+        op_state->data_bytes_expected == op_state->hdr.size && // Expecting file content
+        op_state->hdr.op == WEBREPL_OP_PUT_FILE && op_state->fp != NULL) {
+
+        if (remaining_len > 0) {
+            size_t bytes_to_write = remaining_len;
+            // Check if received data exceeds expected size
+            if (op_state->data_bytes_received + bytes_to_write > op_state->data_bytes_expected) {
+                 ESP_LOGW(TAG, "Client %d PUT: Received more data (%d) than expected (%u). Truncating.",
+                          client_id, (int)bytes_to_write, op_state->data_bytes_expected - op_state->data_bytes_received);
+                 bytes_to_write = op_state->data_bytes_expected - op_state->data_bytes_received;
+            }
+
+            if (bytes_to_write > 0) {
+                 size_t written = fwrite(p_data, 1, bytes_to_write, op_state->fp);
+                 ESP_LOGD(TAG, "PUT '%s': Wrote %d / %d bytes", op_state->filename, (int)written, (int)bytes_to_write);
+                 if (written != bytes_to_write) {
+                     ESP_LOGE(TAG, "Client %d PUT: Error writing to file '%s'", client_id, op_state->filename);
+                     webrepl_send_bin_resp(client_id, WEBREPL_RESP_ERROR);
+                     fclose(op_state->fp);
+                     op_state->fp = NULL;
+                     op_state->active = false; // Abort
+                     return;
+                 }
+                 op_state->data_bytes_received += written;
+                 p_data += written; // Should not be needed
+                 remaining_len -= written;
+            }
+        }
+
+        // Check if PUT complete
+        if (op_state->data_bytes_received == op_state->data_bytes_expected) {
+            ESP_LOGI(TAG, "Client %d PUT: Finished receiving '%s' (%u bytes)",
+                     client_id, op_state->filename, op_state->data_bytes_received);
+            fclose(op_state->fp);
+            op_state->fp = NULL;
+            webrepl_send_bin_resp(client_id, WEBREPL_RESP_OK); // Final OK
+            op_state->active = false; // Operation finished
+        }
+    }
+
+     // --- 5. Handle GET Confirmation (Not standard WebREPL, but maybe useful) ---
+     // MicroPython's client might send a single byte (often 0x00) after receiving
+     // a data chunk to signal readiness for the next one. Our current send logic
+     // doesn't wait for this, it just sends chunks. If we needed to wait:
+     /*
+     if (op_state->active && op_state->hdr.op == WEBREPL_OP_GET_FILE && op_state->fp != NULL) {
+         if (remaining_len > 0) {
+             // Assume it's the confirmation byte
+             ESP_LOGD(TAG,"Client %d GET: Received confirmation byte 0x%02x", client_id, *p_data);
+             if (!webrepl_send_file_chunk(client_id)) {
+                 // File send finished or failed
+             }
+             remaining_len--; // Consumed byte
+         }
+     }
+     */
+
+    if (remaining_len > 0 && op_state->active) {
+         ESP_LOGW(TAG, "Binary Handle: Client %d, %d bytes remaining in chunk after processing phase?", client_id, (int)remaining_len);
+    }
+    ESP_LOGD(TAG,"Binary Handle End: Client %d", client_id);
+}
+// --- END ADDED Binary Handling Functions ---
 
 // Internal helper to actually run Berry code and format response
 static void _be_webrepl_run_code(bvm *vm, int client_id, int client_sockfd, const char* code, size_t len) {
