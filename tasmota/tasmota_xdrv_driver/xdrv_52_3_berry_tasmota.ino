@@ -23,6 +23,29 @@
 #include <berry.h>
 #include <Wire.h>
 
+#ifdef USE_BERRY_WEBREPL // Check if the feature is enabled
+
+// === Add includes needed ONLY for streaming ===
+#include "esp_http_server.h" // For httpd_handle_t, httpd_ws_frame_t, etc.
+
+// === Declare external variables used for streaming ===
+// Use extern "C" if variables are defined in a .c file and this is compiled as .cpp
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Tell the compiler these exist elsewhere (e.g., in be_wsserver_lib.c)
+extern httpd_handle_t ws_server; // Handle for the server managing the WS connection
+extern volatile int g_stream_sockfd; // Target socket for streaming (-1 if none)
+                                     // Added volatile as it might be changed asynchronously
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // USE_BERRY_WEBREPL
+
+
 const uint32_t BERRY_MAX_LOGS = 16;   // max number of print output recorded when outside of REPL, used to avoid infinite grow of logs
 const uint32_t BERRY_MAX_REPL_LOGS = 50;   // max number of print output recorded when inside REPL
 
@@ -1063,16 +1086,57 @@ extern "C" {
 // called as a replacement to Berry `print()`
 void berry_log(const char * berry_buf);
 void berry_log(const char * berry_buf) {
-  const char * pre_delimiter = nullptr;   // do we need to prepend a delimiter if no REPL command
-  size_t max_logs = berry.repl_active ? BERRY_MAX_REPL_LOGS : BERRY_MAX_LOGS;
-  if (berry.log.log.length() == 0) {
-    pre_delimiter = BERRY_CONSOLE_CMD_DELIMITER;
-  }
-  if (berry.log.log.length() >= max_logs) {
-    berry.log.log.remove(berry.log.log.head());
-  }
-  berry.log.addString(berry_buf, pre_delimiter, "\n");
-  AddLog(LOG_LEVEL_INFO, PSTR("%s"), berry_buf);
+
+#ifdef USE_BERRY_WEBREPL
+    // if the webrepl is active, redirect print output to the active websocket client
+    int current_sockfd = g_stream_sockfd; // -1 means no stream
+    httpd_handle_t current_server = ws_server;  
+    if (current_sockfd >= 0 && current_server && berry_buf) {
+
+      size_t buf_len = strlen(berry_buf);
+      size_t message_len = 2 + buf_len + 1; // CRLF prefix + buf + CR suffix
+      char* send_buffer = (char*)malloc(message_len + 1); // +1 for null terminator
+      
+      if (send_buffer) {
+          // Add prefix
+          send_buffer[0] = '\r';
+          send_buffer[1] = '\n';
+          // Copy berry buffer content
+          memcpy(send_buffer + 2, berry_buf, buf_len);
+          // Add suffix
+          send_buffer[2 + buf_len] = '\r';
+          // Null terminate
+          send_buffer[message_len] = '\0'; 
+
+          httpd_ws_frame_t ws_pkt;
+          memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+          ws_pkt.payload = (uint8_t*)send_buffer;
+          ws_pkt.len = message_len; // Use the full message length including CRLFs
+          ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+          esp_err_t ret = httpd_ws_send_frame_async(current_server, current_sockfd, &ws_pkt);
+
+          if (ret != ESP_OK) {
+              ESP_LOGE("berry_log_stream", "httpd_ws_send_frame_async failed for %d: %s", current_sockfd, esp_err_to_name(ret));
+          } 
+          free(send_buffer);
+      } else {
+          g_stream_sockfd = -1;       //something went wrong, disable streaming
+          ESP_LOGE("berry_log_stream", "disabled. Print buffer malloc failed (size=%d)", message_len + 1);
+      }
+    return;
+    }
+#endif // USE_BERRY_WEBREPL 
+    const char * pre_delimiter = nullptr;   // do we need to prepend a delimiter if no REPL command
+    size_t max_logs = berry.repl_active ? BERRY_MAX_REPL_LOGS : BERRY_MAX_LOGS;
+    if (berry.log.log.length() == 0) {
+      pre_delimiter = 0;
+    }
+    if (berry.log.log.length() >= max_logs) {
+      berry.log.log.remove(berry.log.log.head());
+    }
+    berry.log.addString(berry_buf, pre_delimiter, "\n");
+    AddLog(LOG_LEVEL_INFO, PSTR("%s"), berry_buf);
 }
 
 const uint16_t LOGSZ = 128;                 // Max number of characters in log line

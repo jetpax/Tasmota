@@ -53,8 +53,9 @@ typedef struct {
     ws_client_state_t state; // Client state for WebREPL/Normal App
     char password_buffer[20]; // Buffer for password input
     uint8_t password_len;
-    char command_buffer[256]; // Buffer for accumulating REPL commands - ADDED TO MATCH
-    uint8_t command_len;     // Current length of command in buffer - ADDED TO MATCH
+    char command_buffer[256]; // Buffer for accumulating REPL commands
+    uint8_t command_len;     // Current length of command in buffer
+    bool raw_repl_mode;      // ADDED: Flag for RAW REPL mode
 } ws_client_t;
 
 extern ws_client_t ws_clients[]; // Direct access or provide accessor
@@ -179,35 +180,44 @@ void be_webrepl_execute_code(bvm *vm, int client_id, const char* code, size_t le
     // Prepare response
     char response_buffer[1024] = {0};
     
+    // Determine if prompt should be included based on raw mode
+    const char* prompt = ws_clients[client_id].raw_repl_mode ? "" : ">>> ";
+    const char* newline = ws_clients[client_id].raw_repl_mode ? "" : "\r\n";
+    
     if (result == BE_OK) {
         if (be_top(vm) > initial_top) {
             // We have a result value - check if it's nil
             if (be_isnil(vm, -1)) {
                 // Don't display nil values
                 ESP_LOGI(TAG, "Client %d: Result is nil, sending empty result", client_id);
-                snprintf(response_buffer, sizeof(response_buffer), "\r\n>>> ");
+                snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
             } else {
                 // Non-nil value, display it
                 const char *result_str = be_tostring(vm, -1);
                 if (result_str) {
                     ESP_LOGI(TAG, "Client %d: Result value: '%s'", client_id, result_str);
-                    snprintf(response_buffer, sizeof(response_buffer), "\r\n%s\r\n>>> ", result_str);
+                    // Prepend newline only if not raw and result isn't empty
+                    const char* result_prefix = ws_clients[client_id].raw_repl_mode ? "" : "\r\n";
+                    snprintf(response_buffer, sizeof(response_buffer), "%s%s%s%s", 
+                            result_prefix, result_str, newline, prompt);
                 } else {
                     ESP_LOGI(TAG, "Client %d: Result conversion to string failed", client_id);
-                    snprintf(response_buffer, sizeof(response_buffer),  "\r\n>>> ");
+                    snprintf(response_buffer, sizeof(response_buffer),  "%s%s", newline, prompt);
                 }
             }
         } else {
             ESP_LOGI(TAG, "Client %d: No result value", client_id);
-            snprintf(response_buffer, sizeof(response_buffer), "\r\n>>> ");
+            snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
         }
     } else {
         // Error occurred
         const char *error_str = be_tostring(vm, -1);
         ESP_LOGE(TAG, "Client %d: Execution error: %s", client_id, 
                 error_str ? error_str : "Unknown error");
-        snprintf(response_buffer, sizeof(response_buffer), "\r\nError: %s\r\n>>> ", 
-                 error_str ? error_str : "Unknown error");
+        // Prepend newline only if not raw
+        const char* error_prefix = ws_clients[client_id].raw_repl_mode ? "" : "\r\n";        
+        snprintf(response_buffer, sizeof(response_buffer), "%sError: %s%s%s", 
+                 error_prefix, error_str ? error_str : "Unknown error", newline, prompt);
         be_pop(vm, 1); // Pop the error
     }
     

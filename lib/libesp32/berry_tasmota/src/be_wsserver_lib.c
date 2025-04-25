@@ -96,6 +96,7 @@ typedef struct {
     uint8_t password_len;
     char command_buffer[256]; // Buffer for accumulating REPL commands
     uint8_t command_len;     // Current length of command in buffer
+    bool raw_repl_mode;      // ADDED: Flag for RAW REPL mode
 } ws_client_t;
 
 // Callback structure to properly store Berry callbacks
@@ -312,7 +313,16 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
             ESP_LOGI(TAG, "Handling WebSocket disconnect event in main task: client=%d", client_id);
             callBerryWsDispatcher(vm, client_id, "disconnect", NULL, 2);
             
+            // ===> ADDED: Stop stream capture if this client was capturing
+            if (g_stream_sockfd == ws_clients[client_id].sockfd) {
+                g_stream_sockfd = -1;
+                 ESP_LOGI(TAG, "Stopped print capture (client %d disconnected)", client_id);
+            }
+            
             // Reset client state on disconnect processing in main task
+            ESP_LOGW(TAG, "Main Task Handler: Resetting state for disconnected client %d (current state: %d, sockfd: %d)", 
+                     client_id, ws_clients[client_id].state, ws_clients[client_id].sockfd);
+                     
             ws_clients[client_id].sockfd = -1;
             ws_clients[client_id].state = WS_STATE_INIT; // Reset state
             ws_clients[client_id].password_len = 0;
@@ -383,6 +393,9 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
                         // Password Correct
                         ESP_LOGI(TAG, "Client %d authenticated.", client_id);
                         ws_clients[client_id].state = WS_STATE_REPL; // Transition state
+                        // ===> ADDED: Start stream capture for this client
+                        g_stream_sockfd = sockfd;
+                        ESP_LOGI(TAG, "Started print capture for client %d (socket %d) on REPL entry", client_id, sockfd);
                         send_ws_text_frame(sockfd, "\r\nWebREPL connected\r\n>>> ");
                     } else {
                         // Password Incorrect
@@ -434,6 +447,9 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
                         // Password Correct
                         ESP_LOGI(TAG, "Client %d authenticated.", client_id);
                         ws_clients[client_id].state = WS_STATE_REPL; // Transition state
+                        // ===> ADDED: Start stream capture for this client
+                        g_stream_sockfd = sockfd;
+                        ESP_LOGI(TAG, "Started print capture for client %d (socket %d) on REPL entry", client_id, sockfd);
                         send_ws_text_frame(sockfd, "WebREPL connected\r\n>>> ");
                     } else {
                         // Password Incorrect
@@ -485,6 +501,53 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
             }
         } else if (state == WS_STATE_REPL) {
             // REPL command handling
+            ESP_LOGI(TAG, "REPL Handler Start: Client %d, State = %d, RawMode = %d", client_id, state, ws_clients[client_id].raw_repl_mode);
+
+            // Check for single-character control codes *first*
+            if (len == 1) {
+                char ctrl_char = data[0];
+                bool handled = true; // Assume handled unless proven otherwise
+                switch (ctrl_char) {
+                    case 0x01: // Ctrl+A: Enter RAW REPL
+                        ESP_LOGI(TAG, "Client %d: Entering RAW REPL mode (^A)", client_id);
+                        ws_clients[client_id].raw_repl_mode = true;
+                        send_ws_text_frame(sockfd, "raw REPL; CTRL-B to exit\r\n"); 
+                        break;
+                    case 0x02: // Ctrl+B: Enter Friendly REPL
+                        ESP_LOGI(TAG, "Client %d: Entering Friendly REPL mode (^B)", client_id);
+                        ws_clients[client_id].raw_repl_mode = false;
+                        send_ws_text_frame(sockfd, "OK\r\n>>> "); // Send prompt immediately
+                        break;
+                    case 0x03: // Ctrl+C: Interrupt
+                        ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
+                        ws_clients[client_id].command_len = 0; // Clear buffer
+                        ws_clients[client_id].command_buffer[0] = '\0';
+                        // TODO: Add VM interrupt logic if possible
+                        if (!ws_clients[client_id].raw_repl_mode) {
+                            send_ws_text_frame(sockfd, "\r\n>>> "); // Send prompt if not raw
+                        }
+                        break;
+                    case 0x04: // Ctrl+D: Soft reset / End of input
+                        ESP_LOGI(TAG, "Client %d: Soft Reset / EOF received (^D)", client_id);
+                         ws_clients[client_id].command_len = 0; // Clear buffer
+                        ws_clients[client_id].command_buffer[0] = '\0';
+                        // TODO: Add soft reset logic if possible
+                        if (!ws_clients[client_id].raw_repl_mode) {
+                             send_ws_text_frame(sockfd, "\r\n>>> "); // Send prompt if not raw
+                        }
+                        // Maybe close connection or handle EOF?
+                        break;
+                    default:
+                        handled = false; // Not a handled control character
+                        break;
+                }
+                if (handled) {
+                     ESP_LOGI(TAG, "REPL Handler End (Control Char): Client %d, State = %d", client_id, ws_clients[client_id].state);
+                    return; // Don't process as normal input
+                }
+            }
+            
+            // If not a handled control char, proceed with normal command processing
             bool is_enter = false;
             bool has_command = false;
             size_t command_length = len;
@@ -553,8 +616,10 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
                     ws_clients[client_id].command_len = 0;
                     ws_clients[client_id].command_buffer[0] = '\0';
                 } else {
-                    // Empty command, just show prompt
-                    send_ws_text_frame(sockfd, "\r\n>>> ");
+                    // Empty command, just show prompt if not in raw mode
+                    if (!ws_clients[client_id].raw_repl_mode) {
+                         send_ws_text_frame(sockfd, "\r\n>>> ");
+                    }
                 }
             } 
             else if (is_enter && has_command) {
@@ -594,8 +659,10 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
             }
             else {
                 // Not Enter - accumulate command character(s)
-                // Echo the character(s) as received
-                send_ws_text_frame(sockfd, data);
+                // Only echo if not in raw mode
+                if (!ws_clients[client_id].raw_repl_mode) {
+                    send_ws_text_frame(sockfd, data);
+                }
                 
                 size_t available_space = sizeof(ws_clients[client_id].command_buffer) - 
                                     ws_clients[client_id].command_len - 1; // -1 for null terminator
@@ -627,6 +694,7 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
                     ws_clients[client_id].command_buffer[0] = '\0';
                 }
             }
+            ESP_LOGI(TAG, "REPL Handler End: Client %d, State = %d, RawMode = %d", client_id, ws_clients[client_id].state, ws_clients[client_id].raw_repl_mode);
         } else if (state == WS_STATE_NORMAL_APP) {
             // Route to normal Berry message callback
             callBerryWsDispatcher(vm, client_id, "message", data, 3);
@@ -791,9 +859,13 @@ static void handle_client_disconnect(int client_slot) {
         return;
     }
 
-    ESP_LOGI(TAG, "WS Client %d disconnected (state was %d)", client_slot, ws_clients[client_slot].state);
+    ESP_LOGW(TAG, "Disconnect Handler: Entered for client %d (socket %d, current state %d)", 
+             client_slot, ws_clients[client_slot].sockfd, ws_clients[client_slot].state);
+
     int sockfd = ws_clients[client_slot].sockfd;
 
+    ESP_LOGI(TAG, "WS Client %d disconnected (state was %d)", client_slot, ws_clients[client_slot].state);
+    
     // Mark client as inactive BEFORE queuing the event
     ws_clients[client_slot].active = false;
 
@@ -880,6 +952,7 @@ static int add_client(int sockfd) {
         ws_clients[slot].password_buffer[0] = '\0'; // Clear password buffer
         ws_clients[slot].command_len = 0;      // Reset command buffer length
         ws_clients[slot].command_buffer[0] = '\0'; // Clear command buffer
+        ws_clients[slot].raw_repl_mode = false; // Reset raw_repl_mode
         ESP_LOGI(TAG, "Added client %d (socket %d), state INIT.", slot, sockfd);
         return slot;
     }
@@ -1439,8 +1512,6 @@ module wsserver (scope: global, strings: weak) {
     close, func(w_wsserver_close)
     on, func(w_wsserver_on)
     is_connected, func(w_wsserver_is_connected)
-    start_capture, func(w_wsserver_start_capture)
-    stop_capture, func(w_wsserver_stop_capture)
 
     // Constants for supported frame types
     TEXT, int(HTTPD_WS_TYPE_TEXT)
