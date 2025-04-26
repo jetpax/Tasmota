@@ -27,7 +27,7 @@
 #include <stddef.h>  // For size_t
 
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_INFO
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #endif
 
 // Berry includes
@@ -145,7 +145,7 @@ ws_client_t ws_clients[MAX_WS_CLIENTS] = {0};
 static be_wsserver_callback_t wsserver_callbacks[3]; // CONNECT, DISCONNECT, MESSAGE
 
 // Forward declaration for processing WebSocket messages in main task context
-void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t len);
+void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t len, void *user_data);
 
 
 // The exact trigger string for WebREPL password prompt
@@ -305,7 +305,7 @@ static void callBerryWsDispatcher(bvm *vm, int client_id, const char *event_name
 // CONTEXT: Main Tasmota Task (Berry VM Context)
 // This function processes messages from the queue in the main task
 // It now routes messages based on client state
-void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t len) {
+void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t len, void *user_data) {
     if (!vm) {
         ESP_LOGE(TAG, "Berry VM is NULL in be_wsserver_handle_message");
         return;
@@ -350,7 +350,7 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         // Check client state to route the message
         ws_client_state_t state = ws_clients[client_id].state;
         int sockfd = ws_clients[client_id].sockfd;
-        bool is_binary_op = (bool)data; // Check if this was queued as binary
+        bool is_binary_op = (user_data != NULL); // Use user_data now!
 
         ESP_LOGI(TAG, "Handling WebSocket message event in main task: client=%d, state=%d, len=%d, is_binary=%d", 
                 client_id, state, (int)len, is_binary_op);
@@ -437,12 +437,10 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         handle_client_disconnect(client_slot); // Disconnect on receive error
         return ret;
     }
-    
-    ESP_LOGD(TAG, "Frame len is %d, type is %d", ws_pkt.len, ws_pkt.type);
-    
+        
     // Handle control frames immediately
     if (ws_pkt.type == HTTPD_WS_TYPE_PONG) {
-        // ESP_LOGI(TAG, "Received PONG from client %d", client_slot);
+        ESP_LOGD(TAG, "Received PONG from client %d", client_slot);
         return ESP_OK;
     } 
     
@@ -453,7 +451,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     }
 
     if (ws_pkt.type == HTTPD_WS_TYPE_PING) {
-        // ESP_LOGI(TAG, "Received PING from client %d", client_slot);
+        ESP_LOGD(TAG, "Received PING from client %d", client_slot);
         httpd_ws_frame_t pong = {0};
         pong.type = HTTPD_WS_TYPE_PONG;
         pong.len = 0;
@@ -596,7 +594,7 @@ static void ws_ping_timer_callback(void* arg) {
             httpd_ws_frame_t ping = {0};
             ping.type = HTTPD_WS_TYPE_PING;
             
-            ESP_LOGI(TAG, "Sending PING to client %d", i);
+            ESP_LOGD(TAG, "Sending PING to client %d", i);
             esp_err_t ret = httpd_ws_send_frame_async(ws_server, ws_clients[i].sockfd, &ping);
             
             if (ret != ESP_OK) {

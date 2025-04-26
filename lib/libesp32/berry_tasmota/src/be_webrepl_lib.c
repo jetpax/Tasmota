@@ -203,6 +203,24 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
     if (!is_client_valid(client_id)) return;
 
     webrepl_binop_state_t *op_state = &ws_clients[client_id].binop;
+
+    // <<< MODIFIED: Handle GET confirmations - check for specific 0x00 byte >>>
+    if (op_state->active && op_state->hdr.op == WEBREPL_OP_GET_FILE && op_state->fp != NULL) {
+        // Check if the received packet is exactly the 1-byte confirmation (0x00)
+        if (len == 1 && data[0] == 0x00) { 
+            ESP_LOGD(TAG,"Client %d GET: Received confirmation byte 0x00, sending next chunk.", client_id);
+            if (!webrepl_send_file_chunk(client_id)) {
+                // File send finished or failed, state already cleaned up by helper
+                ESP_LOGD(TAG,"Client %d GET: Send finished/failed after confirmation.", client_id);
+            }
+        } else {
+             ESP_LOGW(TAG,"Client %d GET: Received unexpected binary data (len %d, data[0]=0x%02x) during active GET. Ignoring.", 
+                      client_id, (int)len, (len > 0 ? data[0] : 0xFF));
+        }
+        return; // Done handling this packet (either confirmation or unexpected data)
+    }
+    // <<< END MODIFICATION >>>
+
     const uint8_t* p_data = data;
     size_t remaining_len = len;
 
@@ -318,11 +336,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
                 } else if (op_state->hdr.op == WEBREPL_OP_GET_FILE) {
                     op_state->data_bytes_expected = 0; // Not expecting client data
                     op_state->data_bytes_received = 0; // Will track bytes *sent*
-                    ESP_LOGD(TAG,"Starting send for GET '%s'", op_state->filename);
-                    if (!webrepl_send_file_chunk(client_id)) {
-                        // File send finished immediately or failed
-                        // State already cleaned up by helper
-                    }
+                    ESP_LOGD(TAG,"GET ready for client %d, waiting for confirmation (0x00) before sending '%s'", client_id, op_state->filename);
                 }
             }
         }
@@ -507,7 +521,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
             case 0x01: // Ctrl+A: Enter RAW REPL
                 ESP_LOGI(TAG, "Client %d: Entering RAW REPL mode (^A)", client_id);
                 ws_clients[client_id].raw_repl_mode = true;
-                send_ws_text_frame(sockfd, "raw REPL; CTRL-B to exit\r\n"); 
+                send_ws_text_frame(sockfd, "raw REPL; CTRL-B to exit\r\n>"); 
                 break;
             case 0x02: // Ctrl+B: Enter Friendly REPL
                 ESP_LOGI(TAG, "Client %d: Entering Friendly REPL mode (^B)", client_id);
