@@ -19,6 +19,11 @@
 
 #ifdef USE_BERRY_WSSERVER
 
+#ifndef LOG_LOCAL_LEVEL
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#endif
+
+
 // Standard C includes first
 #include <stdlib.h>
 #include <stdbool.h> // For bool
@@ -26,9 +31,16 @@
 #include <stdint.h>  // For int64_t, uint8_t
 #include <stddef.h>  // For size_t
 
-#ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
-#endif
+// ESP-IDF includes
+#include "esp_http_server.h" // For httpd_handle_t
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_err.h"
+
+// Socket-related includes
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 // Berry includes
 #include "be_vm.h"       // For bvm
@@ -43,20 +55,35 @@
 #include "be_list.h"
 #include "be_module.h"
 
-// ESP-IDF includes
-#include "esp_http_server.h" // For httpd_handle_t
-#include "esp_event.h"
-#include "esp_log.h"
-#include "esp_timer.h"
+#ifdef USE_BERRY_WEBREPL
 
-// Socket-related includes
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include "be_webrepl.h" 
 
-static const char *TAG = "WSS";
+#else
 
-// Max number of concurrent clients
 #define MAX_WS_CLIENTS 5
+// --- Client State Enum ---
+typedef enum {
+    WS_STATE_INIT,       // Just connected, before prompt/trigger check
+    WS_STATE_PASSWORD,   // Sent prompt, awaiting password
+    WS_STATE_REPL,       // Password OK, processing WebREPL commands
+    WS_STATE_NORMAL_APP  // Determined not to be WebREPL
+} ws_client_state_t;
+
+// --- Client Tracking Structure (Shared) ---
+typedef struct {
+    int sockfd;
+    bool active;
+    int64_t last_activity;  // Timestamp of any client activity in milliseconds
+    ws_client_state_t state; // Client state for WebREPL/Normal App
+    char *command_buffer;       // Dynamic buffer
+    size_t command_len;         // Current length in buffer
+    size_t buffer_capacity;     // Allocated capacity
+    webrepl_binop_state_t binop;
+} ws_client_t;
+
+#endif  // USE_BERRY_WEBREPL
+
 
 // Define event types
 #define WSSERVER_EVENT_CONNECT    0
@@ -68,6 +95,8 @@ static const char *TAG = "WSS";
 #define HTTP_MSG_FILE 2
 #define HTTP_MSG_WEB 3
 
+static const char *TAG = "WSS";
+
 // Declarations for the HTTP server functions
 extern httpd_handle_t be_httpserver_get_handle(void);
 extern bool httpserver_queue_message(int msg_type, int client_id, 
@@ -78,35 +107,6 @@ extern void httpserver_register_external_close_cb(void (*func)(int sockfd));
 extern void be_webrepl_handle_input(bvm *vm, int client_id, const char* code, size_t len);
 extern void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_t len);
 
-typedef enum {
-    WS_STATE_INIT,       // Just connected, before prompt/trigger check
-    WS_STATE_PASSWORD,   // Sent prompt, awaiting password
-    WS_STATE_REPL,       // Password OK, processing WebREPL commands
-    WS_STATE_NORMAL_APP  // Determined not to be WebREPL
-} ws_client_state_t;
-
-// Client tracking structure
-typedef struct {
-    int sockfd;
-    bool active;
-    int64_t last_activity;  // Timestamp of any client activity in milliseconds
-    ws_client_state_t state; // Client state for WebREPL/Normal App
-    char command_buffer[256]; // Buffer for accumulating WebREPL commands
-    uint8_t command_len;     // Current length of command in buffer
-    bool raw_repl_mode;      // Flag for RAW WebREPL mode
-
-    // State for WebREPL binary operations (mirroring webrepl_lib.c)
-    struct webrepl_binop_state_t_tag { // Define inline struct to avoid direct include
-        bool active;
-        uint8_t _hdr_placeholder[20]; // Placeholder for hdr (avoid needing webrepl_binhdr_t)
-        uint32_t hdr_bytes_received;
-        uint32_t data_bytes_expected;
-        uint32_t data_bytes_received;
-        void *fp; // Use void* to avoid FILE* dependency here
-        char filename[128];
-    } binop;
-
-} ws_client_t;
 
 // Callback structure to properly store Berry callbacks
 typedef struct be_wsserver_callback_t {
@@ -121,7 +121,6 @@ static int find_free_client_slot(void);
 static int add_client(int sockfd);
 static int find_client_by_fd(int sockfd);
 static void remove_client(int slot);
-static void handle_client_disconnect(int client_slot);
 static void callBerryWsDispatcher(bvm *vm, int client_id, const char *event_name, const char *payload, int arg_count);
 static void check_clients(void);
 // Helper functions for server start
@@ -130,16 +129,16 @@ static bool register_ws_handler(const char* path);
 static void start_ping_timer(void);
 
 // Globals
-httpd_handle_t ws_server = NULL;
-int g_stream_sockfd = -1;
+httpd_handle_t ws_server = NULL; // Define the actual storage
+volatile int g_stream_sockfd = -1; // <<< FIXED: Add volatile to match declaration
 
 static bool wsserver_running = false;
 static uint32_t ping_interval_s;  // Ping interval in seconds
 static uint32_t ping_timeout_s;   // Activity timeout in seconds
 static esp_timer_handle_t ping_timer = NULL;
 
-// Client status and context
-ws_client_t ws_clients[MAX_WS_CLIENTS] = {0};
+
+ws_client_t ws_clients[MAX_WS_CLIENTS]; // Define the actual storage
 
 // Storage for Berry callback functions
 static be_wsserver_callback_t wsserver_callbacks[3]; // CONNECT, DISCONNECT, MESSAGE
@@ -153,7 +152,9 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
 // Placeholder for the actual WebREPL password - needs proper implementation/configuration
 static const char* webrepl_password = "password"; // CHANGE THIS!
 
-// Helper to send prompts/frames directly from C
+// Helper to send prompts/frames directly from C - REMOVED (declared extern in be_webrepl.h)
+// void send_ws_text_frame(int sockfd, const char* text) { ... }
+// Definition stays here
 void send_ws_text_frame(int sockfd, const char* text) {
     if (sockfd < 0 || !ws_server || !text) {
         ESP_LOGE(TAG, "Invalid parameters in send_ws_text_frame: sockfd=%d, ws_server=%p, text=%p", 
@@ -178,7 +179,9 @@ void send_ws_text_frame(int sockfd, const char* text) {
     }
 }
 
-// Check if a client is valid and connected
+// Check if a client is valid and connected - REMOVED (declared extern in be_webrepl.h)
+// bool is_client_valid(int client_id) { ... }
+// Definition stays here
 bool is_client_valid(int client_id) {
     // Check for valid client ID range
     if (client_id < 0 || client_id >= MAX_WS_CLIENTS) {
@@ -196,6 +199,9 @@ bool is_client_valid(int client_id) {
 }
 
 
+// REMOVED (declared extern in be_webrepl.h)
+// void send_ws_text_frame_to_client(int client_id, const char* text) { ... }
+// Definition stays here
 void send_ws_text_frame_to_client(int client_id, const char* text) {
     if (!is_client_valid(client_id) || !text) {
         ESP_LOGE(TAG, "Invalid parameters in send_ws_text_frame_to_client: client_id=%d, valid=%d, text=%p", 
@@ -342,8 +348,10 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
             
             ws_clients[client_id].sockfd = -1;
             ws_clients[client_id].state = WS_STATE_INIT; // Reset state
-            ws_clients[client_id].command_len = 0; // Also reset command buffer
-            ws_clients[client_id].command_buffer[0] = '\0';
+            if (ws_clients[client_id].command_buffer) {
+                ws_clients[client_id].command_len = 0;
+                ws_clients[client_id].command_buffer[0] = '\0';
+            }
         }
     } else {
         // Normal message event with data
@@ -490,8 +498,11 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     // new ws message received successfully
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT) {
         const char* text_payload = (const char*)buf;
-        ESP_LOGD(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].state, ws_pkt.len, text_payload ? text_payload : "");
-                
+        if ((ws_pkt.len == 1) && (text_payload[0]  < 0x20 || text_payload[0]  == 0x7F)) {
+            ESP_LOGD(TAG, "Client %d (State:%d) Received CTRL char '[0x%02X]'", client_slot, ws_clients[client_slot].state, text_payload[0] );
+        } else {
+            ESP_LOGD(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].state, ws_pkt.len, text_payload ? text_payload : "");
+        }                
         // Queue the message - httpserver_queue_message will make its own copy
         if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, text_payload, ws_pkt.len, NULL)) {
             ESP_LOGE(TAG, "WS Q message failed!");
@@ -524,9 +535,10 @@ static void wsserver_socket_cleanup_cb(int sockfd) {
     }
 }
 
-// Handle client disconnection
-// CONTEXT: Can be called from HTTP Server Task or other contexts (e.g., timer)
-static void handle_client_disconnect(int client_slot) {
+// Handle client disconnection - REMOVED (declared extern in be_webrepl.h)
+// static void handle_client_disconnect(int client_slot) { ... }
+// Definition needs to be non-static now and stays here
+void handle_client_disconnect(int client_slot) {
     if (client_slot < 0 || client_slot >= MAX_WS_CLIENTS || !ws_clients[client_slot].active) {
         // Already inactive or invalid slot
         return;
@@ -549,8 +561,10 @@ static void handle_client_disconnect(int client_slot) {
         // Ensure cleanup happens if queuing fails
         ws_clients[client_slot].sockfd = -1;
         ws_clients[client_slot].state = WS_STATE_INIT;
-        ws_clients[client_slot].command_len = 0; // Also reset command buffer
-        ws_clients[client_slot].command_buffer[0] = '\0';
+        if (ws_clients[client_slot].command_buffer) {
+            ws_clients[client_slot].command_len = 0;
+            ws_clients[client_slot].command_buffer[0] = '\0';
+        }
     }
 
     // Clean up any active binary operation state BEFORE clearing the slot
@@ -563,6 +577,15 @@ static void handle_client_disconnect(int client_slot) {
             ws_clients[client_slot].binop.fp = NULL;
         }
         ws_clients[client_slot].binop.active = false;
+    }
+
+    // <<< ADDED: Free the dynamic command buffer >>>
+    if (ws_clients[client_slot].command_buffer) {
+        ESP_LOGD(TAG, "Disconnect Handler: Freeing command buffer for client %d", client_slot);
+        free(ws_clients[client_slot].command_buffer);
+        ws_clients[client_slot].command_buffer = NULL;
+        ws_clients[client_slot].command_len = 0;
+        ws_clients[client_slot].buffer_capacity = 0;
     }
 }
 
@@ -631,9 +654,9 @@ static int add_client(int sockfd) {
         ws_clients[slot].active = true;
         ws_clients[slot].last_activity = esp_timer_get_time() / 1000; // Use ms
         ws_clients[slot].state = WS_STATE_INIT; // Start in INIT state
-        ws_clients[slot].command_len = 0;      // Reset command buffer length
-        ws_clients[slot].command_buffer[0] = '\0'; // Clear command buffer
-        ws_clients[slot].raw_repl_mode = false; // Reset raw_repl_mode
+        ws_clients[slot].command_buffer = NULL;      // Initialized to NULL
+        ws_clients[slot].command_len = 0;          // Initialized to 0
+        ws_clients[slot].buffer_capacity = 0;      // Initialized to 0
         memset(&ws_clients[slot].binop, 0, sizeof(ws_clients[slot].binop)); // Initialize binary op state
         ESP_LOGI(TAG, "Added client %d (socket %d), state INIT.", slot, sockfd);
         return slot;
@@ -1113,10 +1136,9 @@ static int w_wsserver_set_repl_mode(bvm *vm) {
                          is_repl ? "REPL" : "Normal App", 
                          old_state, new_state);
                  ws_clients[client_id].state = new_state;
-                 ws_clients[client_id].raw_repl_mode = false; // Always start WebREPL in friendly mode
                  
                  // If entering REPL, clear any old command buffer
-                 if (is_repl) {
+                 if (is_repl && ws_clients[client_id].command_buffer) {
                      ws_clients[client_id].command_len = 0;
                      ws_clients[client_id].command_buffer[0] = '\0';
                  }

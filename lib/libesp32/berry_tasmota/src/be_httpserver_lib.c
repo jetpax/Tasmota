@@ -455,7 +455,7 @@ static int w_httpserver_process_queue(bvm *vm) {
                     } else {
                         ESP_LOGD(TAG, "QUEUE DATA: '' (connect/disconnect event)");
                     }
-                    be_wsserver_handle_message(vm, msg.client_id, msg.data, msg.data_len);
+                    be_wsserver_handle_message(vm, msg.client_id, msg.data, msg.data_len, msg.user_data);
                     // Free the data buffer we allocated
                     if (msg.data) {
                         free(msg.data);

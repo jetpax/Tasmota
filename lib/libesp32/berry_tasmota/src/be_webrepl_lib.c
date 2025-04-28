@@ -17,86 +17,33 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+
 #ifdef USE_BERRY_WEBREPL
 
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_INFO
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #endif
 
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include "esp_log.h"
-#include "esp_http_server.h"
-#include "freertos/FreeRTOS.h" // If using queues specific to REPL
-#include <stdio.h> // For FILE*, fopen, etc.
 
+#include <string.h>
+
+// ESP-IDF / FreeRTOS includes 
+#include "esp_log.h"
+#include "esp_err.h" 
+// #include "esp_http_server.h" // Provided by be_webrepl.h
+#include "freertos/FreeRTOS.h" 
+
+// Berry includes
 #include "be_vm.h"
 #include "be_exec.h"
 
+
+#include "be_webrepl.h" // <<< Include the new header
+
+
+
 #define TAG "WEBREPL"
 
-// Max number of concurrent clients
-#define MAX_WS_CLIENTS 5
-
-// --- BEGIN ADDED Binary Protocol definitions ---
-// Mirroring MicroPython's WebREPL binary protocol header
-typedef struct __attribute__((packed)) { // Use packed to match potential uPy layout
-    char sig[2];        // Should be 'W', 'A'
-    uint8_t op;         // 1=PUT_FILE, 2=GET_FILE
-    uint8_t flags;      // Currently unused?
-    uint64_t offset;    // File offset for PUT/GET (Little Endian)
-    uint32_t size;      // File size for PUT (Little Endian)
-    uint16_t fname_len; // Length of filename (Little Endian)
-    // Filename follows immediately
-} webrepl_binhdr_t;
-
-#define WEBREPL_HDR_SIG "WA"
-#define WEBREPL_OP_PUT_FILE 1
-#define WEBREPL_OP_GET_FILE 2
-#define WEBREPL_RESP_OK 0
-#define WEBREPL_RESP_ERROR 1
-
-// State for an ongoing binary operation for a specific client
-typedef struct {
-    bool active; // Is a binary operation in progress?
-    webrepl_binhdr_t hdr;
-    uint32_t hdr_bytes_received;
-    uint32_t data_bytes_expected; // Filename len OR file size
-    uint32_t data_bytes_received;
-    FILE *fp;
-    char filename[128]; // Max filename length + safety margin
-} webrepl_binop_state_t;
-// --- END ADDED Binary Protocol definitions ---
-
-typedef enum {
-    WS_STATE_INIT,       // Just connected, before prompt/trigger check
-    WS_STATE_PASSWORD,   // Sent prompt, awaiting password
-    WS_STATE_REPL,       // Password OK, processing REPL commands
-    WS_STATE_NORMAL_APP  // Determined not to be REPL
-} ws_client_state_t;
-
-// Client tracking structure
-typedef struct {
-    int sockfd;
-    bool active;
-    int64_t last_activity;  // Timestamp of any client activity in milliseconds
-    ws_client_state_t state; // Client state for WebREPL/Normal App
-    char command_buffer[256]; // Buffer for accumulating REPL commands
-    uint8_t command_len;     // Current length of command in buffer
-    bool raw_repl_mode;      // Flag for RAW REPL mode
-    webrepl_binop_state_t binop; // <<< ADDED
-} ws_client_t;
-
-extern ws_client_t ws_clients[]; // Direct access or provide accessor
-
-extern httpd_handle_t ws_server; // Assumed global server handle
-
-extern ws_client_t ws_clients[]; // Direct access or provide accessor
-extern bool is_client_valid(int client_id); // Need this function
-extern void handle_client_disconnect(int client_slot); // Need this
-extern volatile int g_stream_sockfd; // For print streaming
-extern httpd_handle_t g_stream_server_handle; // For print streaming
 
 // --- WebREPL Specific Constants ---
 #define WEBREPL_PASSWORD_PROMPT "Password: "
@@ -105,12 +52,6 @@ static const char* webrepl_password = "password"; // CHANGE THIS!
 
 // --- WebREPL Helper Functions ---
 
-extern void send_ws_text_frame(int sockfd, const char* text) ;
-extern void send_ws_text_frame_to_client(int client_id, const char* text);
-
-// --- BEGIN ADDED Binary Handling Functions ---
-
-// Helper to send binary responses (status codes)
 static void webrepl_send_bin_resp(int client_id, uint16_t code) {
     if (!is_client_valid(client_id)) return;
     int sockfd = ws_clients[client_id].sockfd;
@@ -132,7 +73,7 @@ static void webrepl_send_bin_resp(int client_id, uint16_t code) {
     }
 }
 
-// Helper function to send file chunk for GET requests
+// Helper function to send file chunk for GET requests - Implementation stays here
 static bool webrepl_send_file_chunk(int client_id) {
      if (!is_client_valid(client_id)) return false;
      webrepl_binop_state_t *op_state = &ws_clients[client_id].binop;
@@ -198,7 +139,7 @@ static bool webrepl_send_file_chunk(int client_id) {
 }
 
 // Called when ws_handler receives BINARY
-// Process incoming binary data (called from main task handler)
+// Process incoming binary data (called from main task handler) - Implementation stays here
 void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_t len) {
     if (!is_client_valid(client_id)) return;
 
@@ -268,7 +209,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
                       client_id, op_state->hdr.op, op_state->hdr.fname_len, op_state->hdr.size);
              op_state->data_bytes_expected = op_state->hdr.fname_len; // Now expect filename
              op_state->data_bytes_received = 0;
-             op_state->filename[0] = ' ';
+             op_state->filename[0] = '\0';
         }
     }
 
@@ -286,7 +227,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
 
         // Filename complete?
         if (op_state->data_bytes_received == op_state->data_bytes_expected) {
-            op_state->filename[op_state->data_bytes_received] = ' '; // Terminate filename
+            op_state->filename[op_state->data_bytes_received] = '\0'; // Terminate filename
             ESP_LOGI(TAG, "Binary Handle: Client %d Op %d, Filename '%s' received.", client_id, op_state->hdr.op, op_state->filename);
 
             // --- Prepare for File Data or Action ---
@@ -409,89 +350,149 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
 }
 // --- END ADDED Binary Handling Functions ---
 
-// Internal helper to actually run Berry code and format response
-static void _be_webrepl_run_code(bvm *vm, int client_id, int client_sockfd, const char* code, size_t len) {
-    ESP_LOGI(TAG, "_be_webrepl_run_code: Client %d (socket %d): Executing %d bytes of code", 
-             client_id, client_sockfd, (int)len);
-
+// <<< NEW FUNCTION: Attempts to load and execute Berry code >>> - Implementation stays here
+static int _be_webrepl_attempt_execute(bvm *vm, const char* code, size_t len) {
     int initial_top = be_top(vm);
     int result;
-    
-    // Try as regular statement first
-    ESP_LOGD(TAG, "Client %d: Attempting to load code as statement", client_id);
+    bool loaded = false;
+
+    // 1. Try as statement
+    ESP_LOGD(TAG, "Attempting to load code as statement");
     result = be_loadbuffer(vm, "webrepl", code, len);
     
-    // Try as expression if statement loading failed
-    if (result != BE_OK) {
-        ESP_LOGD(TAG, "Client %d: Load as statement failed (%d), trying as expression", client_id, result);
-        be_pop(vm, 1); // Pop error from failed load
-        
+    if (result == BE_OK) {
+        // Statement loaded OK
+        loaded = true;
+    } else if (be_getexcept(vm, result) == BE_SYNTAX_ERROR) {
+        // Statement syntax error -> try as expression
+        ESP_LOGD(TAG, "Load as statement failed (Syntax Error), trying as expression");
+        be_pop(vm, 2); // Pop statement syntax error items (assuming 2 based on CmndBrRun)
+
+        // Format expression: return (...)
         size_t expr_len = len + 10; // "return ()"
         char *expr = malloc(expr_len);
         if (expr) {
-            int written = snprintf(expr, expr_len, "return (%.*s)", (int)len, code);
+            // Strip trailing newline(s) for the expression body
+            int expr_code_len = len;
+            if (expr_code_len > 0 && code[expr_code_len - 1] == '\n') {
+                expr_code_len--;
+                if (expr_code_len > 0 && code[expr_code_len - 1] == '\r') {
+                    expr_code_len--;
+                }
+            }
+
+            int written = snprintf(expr, expr_len, "return (%.*s)", expr_code_len, code);
             if (written > 0 && written < expr_len) {
-                ESP_LOGD(TAG, "Client %d: Trying as expression: '%s'", client_id, expr);
-                result = be_loadbuffer(vm, "webrepl", expr, written);
+                ESP_LOGD(TAG, "Trying as expression: '%s'", expr);
+                result = be_loadbuffer(vm, "webrepl", expr, written); // Try loading expression
+                if (result == BE_OK) {
+                    loaded = true; // Expression loaded OK
+                } else {
+                    // Expression load failed (Syntax or other error)
+                    ESP_LOGE(TAG, "Load as expression failed: %d", result);
+                    // Error object is on stack. Leave it for the caller.
+                    loaded = false;
+                }
             } else {
                  result = BE_EXEC_ERROR; // Indicate failure if snprintf failed
+                 loaded = false;
+                 ESP_LOGE(TAG, "Failed to format expression string");
             }
             free(expr);
         } else {
-            ESP_LOGE(TAG, "Client %d: Failed to allocate memory for expression", client_id);
+            ESP_LOGE(TAG, "Failed to allocate memory for expression");
             result = BE_MALLOC_FAIL; 
+            loaded = false;
         }
-    }
-    
-    // Execute if loaded successfully
-    if (result == BE_OK) {
-        ESP_LOGD(TAG, "Client %d: Code loaded successfully, executing", client_id);
-        result = be_pcall(vm, 0);
-        ESP_LOGI(TAG, "Client %d: Code execution result: %s (%d)", client_id, 
-                result == BE_OK ? "succeeded" : "failed", result);
     } else {
-        ESP_LOGE(TAG, "Client %d: Failed to load code: %d", client_id, result);
+        // Statement load failed (Non-syntax error, e.g., memory)
+        ESP_LOGE(TAG, "Load as statement failed (Non-syntax): %d", result);
+        // Error object is on stack. Leave it for the caller.
+        loaded = false;
     }
     
-    // Prepare and send response (uses client_id to check raw_repl_mode)
+    // 2. Execute if loaded successfully
+    if (loaded) {
+        ESP_LOGD(TAG, "Code loaded successfully, executing");
+        result = be_pcall(vm, 0); // Can return BE_OK or BE_EXCEPTION
+        // If BE_OK, result value is on stack.
+        // If BE_EXCEPTION, error object (presumably 2 items) is on stack.
+    }
+
+    // 3. Final result determination
+    // The stack should contain: result value (if BE_OK), or error object(s) otherwise.
+    // This is handled by _be_webrepl_send_result.
+    // No explicit stack cleanup needed here anymore.
+
+    return result; // Return the final status (BE_OK, BE_EXCEPTION, or Load Error code)
+}
+
+// <<< NEW FUNCTION: Formats and sends REPL response/error >>> - Implementation stays here
+static void _be_webrepl_send_result(bvm *vm, int client_id, int client_sockfd, int exec_result) {
     char response_buffer[1024] = {0};
-    const char* prompt = ws_clients[client_id].raw_repl_mode ? "" : ">>> ";
-    const char* newline = ws_clients[client_id].raw_repl_mode ? "" : "\r\n";
-    
-    if (result == BE_OK) {
-        if (be_top(vm) > initial_top) {
-             if (be_isnil(vm, -1)) {
+    const char* prompt = ">>> ";
+    const char* newline = "\r\n";
+    int original_top = be_top(vm); // Capture top BEFORE processing result/error
+    int items_to_pop = 0; // How many items to pop at the end
+
+    if (exec_result == BE_OK) {
+        // Handle successful execution result
+        if (original_top > 0) { // Check if stack has at least one item (the result)
+            int result_index = -1; // Use relative index from top
+            if (be_isnil(vm, result_index)) {
                 snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
-             } else {
-                const char *result_str = be_tostring(vm, -1);
+            } else {
+                const char *result_str = be_tostring(vm, result_index); 
                 if (result_str) {
-                    const char* result_prefix = ws_clients[client_id].raw_repl_mode ? "" : "\r\n";
                     snprintf(response_buffer, sizeof(response_buffer), "%s%s%s%s", 
-                            result_prefix, result_str, newline, prompt);
+                             newline, result_str, newline, prompt);
                 } else {
-                     snprintf(response_buffer, sizeof(response_buffer),  "%s%s", newline, prompt);
+                    ESP_LOGW(TAG, "Failed to convert result to string for client %d", client_id);
+                    snprintf(response_buffer, sizeof(response_buffer),  "%s%s", newline, prompt);
                 }
-             }
+            }
+            items_to_pop = 1; // Pop the single result value
         } else {
+             ESP_LOGW(TAG, "Stack unexpectedly empty after BE_OK in _be_webrepl_send_result for client %d!", client_id);
              snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
+             items_to_pop = 0;
         }
-    } else {
-        const char *error_str = be_tostring(vm, -1);
-        const char* error_prefix = ws_clients[client_id].raw_repl_mode ? "" : "\r\n";        
-        snprintf(response_buffer, sizeof(response_buffer), "%sError: %s%s%s", 
-                 error_prefix, error_str ? error_str : "Unknown error", newline, prompt);
-        be_pop(vm, 1); // Pop the error
+    } else { // Any error (BE_SYNTAX_ERROR, BE_EXCEPTION, etc.)
+        ESP_LOGD(TAG, "SendResult Error (%d): Original Top: %d", exec_result, original_top);
+        if (original_top >= 1) { // Assume at least one error item (message)
+             const char *error_str = be_tostring(vm, -1); // Get message from top
+             // Optional: Log the item below the top if expected
+             // if (original_top >= 2) { const char *prev_str = be_tostring(vm, -2); ESP_LOGD(TAG, "Item below top: %s", prev_str?prev_str:"<nil>"); }
+             snprintf(response_buffer, sizeof(response_buffer), "%sError: %s%s%s", 
+                     newline, error_str ? error_str : "Unknown error", newline, prompt);
+             items_to_pop = (original_top >= 2) ? 2 : 1; // Pop 2 if available based on reference, else 1
+             ESP_LOGD(TAG, "SendResult Error: Popping %d items", items_to_pop);
+        } else {
+             ESP_LOGW(TAG, "Stack unexpectedly empty after ERROR (%d) in _be_webrepl_send_result for client %d!", exec_result, client_id);
+             snprintf(response_buffer, sizeof(response_buffer), "%sError: Unknown error%s%s", newline, newline, prompt);
+             items_to_pop = 0;
+        }
     }
-    
-    be_pop(vm, be_top(vm) - initial_top); // Reset stack
-    
-    // Send response (using original sockfd passed in)
+
+    // Send response
     if (client_sockfd >= 0) {
         ESP_LOGD(TAG, "Sending response to client %d (socket %d): '%s'", 
                 client_id, client_sockfd, response_buffer);
         send_ws_text_frame(client_sockfd, response_buffer);
     } else {
-         ESP_LOGE(TAG, "Invalid socket (%d) for client %d, can't send response", client_sockfd, client_id);
+         ESP_LOGE(TAG, "Invalid socket (%d) for client %d, can't send result", client_sockfd, client_id);
+    }
+
+    // Pop result/error items from stack
+    if (items_to_pop > 0) {
+        be_pop(vm, items_to_pop);
+    }
+
+    // Sanity check stack - Log error if mismatch, but don't try to fix it.
+    int expected_final_top = original_top - items_to_pop;
+    if (be_top(vm) != expected_final_top) { 
+         ESP_LOGE(TAG, "Stack imbalance after sending result for client %d! Top: %d, Expected: %d (Original Top: %d, Popped: %d)",
+                 client_id, be_top(vm), expected_final_top, original_top, items_to_pop);
     }
 }
 
@@ -504,195 +505,147 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
         return;
     }
 
-    int sockfd = ws_clients[client_id].sockfd;
+    ws_client_t *client = &ws_clients[client_id]; // Get client struct pointer
+    int sockfd = client->sockfd;
     if (sockfd < 0) {
         ESP_LOGE(TAG, "Invalid sockfd for client %d in be_webrepl_handle_input", client_id);
         return; // Can't proceed without a valid socket
     }
 
-    ESP_LOGD(TAG, "REPL Input Handler Start: Client %d, Socket %d, State = %d, RawMode = %d, Len = %d", 
-             client_id, sockfd, ws_clients[client_id].state, ws_clients[client_id].raw_repl_mode, (int)len);
+    ESP_LOGD(TAG, "REPL Input Handler Start: Client %d, Socket %d, State = %d, Len = %d", 
+             client_id, sockfd, client->state, (int)len);
 
-    // Check for single-character control codes *first*
-    if (len == 1) {
-        char ctrl_char = data[0];
-        bool handled = true; 
-        switch (ctrl_char) {
-            case 0x01: // Ctrl+A: Enter RAW REPL
-                ESP_LOGI(TAG, "Client %d: Entering RAW REPL mode (^A)", client_id);
-                ws_clients[client_id].raw_repl_mode = true;
-                send_ws_text_frame(sockfd, "raw REPL; CTRL-B to exit\r\n>"); 
-                break;
-            case 0x02: // Ctrl+B: Enter Friendly REPL
-                ESP_LOGI(TAG, "Client %d: Entering Friendly REPL mode (^B)", client_id);
-                ws_clients[client_id].raw_repl_mode = false;
-                send_ws_text_frame(sockfd, "OK\r\n>>> ");
-                break;
-            case 0x03: // Ctrl+C: Interrupt
-                ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
-                ws_clients[client_id].command_len = 0; // Clear buffer
-                ws_clients[client_id].command_buffer[0] = '\0';
-                // TODO: Add VM interrupt logic?
-                if (!ws_clients[client_id].raw_repl_mode) {
-                    send_ws_text_frame(sockfd, "\r\n>>> ");
-                }
-                break;
-            case 0x04: // Ctrl+D: Soft reset / End of input
-                ESP_LOGI(TAG, "Client %d: Soft Reset / EOF received (^D)", client_id);
-                 ws_clients[client_id].command_len = 0; // Clear buffer
-                ws_clients[client_id].command_buffer[0] = '\0';
-                // TODO: Add soft reset logic?
-                if (!ws_clients[client_id].raw_repl_mode) {
-                     send_ws_text_frame(sockfd, "\r\n>>> ");
-                }
-                break;
-            default:
-                handled = false; 
-                break;
+    // --- Handle Ctrl+C --- 
+    if (len == 1 && data[0] == 0x03) { // Ctrl+C
+        ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
+        if (client->command_buffer) { // Clear buffer if allocated
+            client->command_len = 0;
+            client->command_buffer[0] = '\0';
         }
-        if (handled) {
-             ESP_LOGD(TAG, "REPL Input Handler End (Control Char): Client %d", client_id);
-            return; // Done handling control char
-        }
+        send_ws_text_frame(sockfd, "\r\n>>> "); // Send prompt
+        ESP_LOGD(TAG, "REPL Input Handler End (Ctrl+C): Client %d", client_id);
+        return;
     }
-    
-    // === Normal Command Processing / Accumulation ===
-    bool is_enter = false;
-    bool has_command = false;
-    size_t command_length = len;
-    
-    // Debug the incoming data hex
-    char hex_debug[128] = {0};
-    for (size_t i = 0; i < len && i < 32; i++) {
-        snprintf(hex_debug + i*3, sizeof(hex_debug) - i*3, "%02x ", (unsigned char)data[i]);
-    }
-    ESP_LOGD(TAG, "REPL received %d bytes for processing: [%s]", (int)len, hex_debug);
-    
-    // Check for line endings (Enter key)
-    if ((len == 1 && (data[0] == '\r' || data[0] == '\n')) || 
-        (len == 2 && data[0] == '\r' && data[1] == '\n')) {
-        is_enter = true;
-        ESP_LOGD(TAG, "Detected standalone line ending");
-    } else if (len > 0) {
-        if (data[len-1] == '\n') {
-            is_enter = true; command_length = len - 1; has_command = true;
-            if (command_length > 0 && data[command_length-1] == '\r') { command_length--; }
-        } else if (data[len-1] == '\r') {
-            is_enter = true; command_length = len - 1; has_command = true;
-        }
-        // Heuristic for full command received at once (non-raw mode)
-        else if (!ws_clients[client_id].raw_repl_mode && len > 1 && ws_clients[client_id].command_len == 0) {
-             has_command = true; command_length = len; is_enter = true; 
-             ESP_LOGD(TAG, "Treating as complete command: %d bytes", (int)command_length);
-        } else if (ws_clients[client_id].raw_repl_mode) {
-             // In raw mode, treat any non-control char input potentially part of a command block
-             has_command = true; command_length = len; is_enter = true; // Execute directly in raw mode for now
-             // TODO: Raw mode could accumulate until ^D before executing?
-        } else {
-            ESP_LOGD(TAG, "Single char or partial command - accumulating");
-        }
-    }
-    
-    // --- Action based on parsed input --- 
-    if (is_enter && !has_command) {
-        // Standalone Enter: Execute accumulated command
-        if (ws_clients[client_id].command_len > 0) {
-            ESP_LOGI(TAG, "Executing accumulated command: '%s' (len: %d)", 
-                     ws_clients[client_id].command_buffer, ws_clients[client_id].command_len);
-            
-            // ===> Set stream for execution <===
-            int original_stream_sockfd = g_stream_sockfd;
-            g_stream_sockfd = sockfd;
-            ESP_LOGD(TAG, "Set stream sockfd to %d for client %d execution", g_stream_sockfd, client_id);
-            
-            _be_webrepl_run_code(vm, client_id, sockfd, ws_clients[client_id].command_buffer, ws_clients[client_id].command_len);
-            
-            // ===> Restore stream sockfd <===
-            g_stream_sockfd = original_stream_sockfd;
-            ESP_LOGD(TAG, "Restored stream sockfd to %d after client %d execution", g_stream_sockfd, client_id);
-            
-            ws_clients[client_id].command_len = 0;
-            ws_clients[client_id].command_buffer[0] = '\0';
-        } else if (!ws_clients[client_id].raw_repl_mode) {
-             send_ws_text_frame(sockfd, "\r\n>>> "); // Empty command, show prompt
-        }
-    } 
-    else if (has_command) { // Includes case where is_enter is true for direct/raw execution
-        // Command data received (might include line endings if is_enter is true)
-        char* command_to_run = NULL;
-        size_t run_len = 0;
-        bool free_command = false;
 
-        // Decide what to execute: accumulated + new, or just new?
-        if (!is_enter || ws_clients[client_id].command_len == 0) { 
-             // Execute the received data directly (raw mode or full command)
-             command_to_run = (char*)data; // Use directly, NO free
-             run_len = command_length;
-             if (!ws_clients[client_id].raw_repl_mode) {
-                send_ws_text_frame(sockfd, data); // Echo if not raw
-             }
-             ESP_LOGI(TAG, "Executing direct/raw command (len: %d)", (int)run_len);
-        } else {
-            // Append to buffer and execute (friendly mode with line ending)
-            size_t available = sizeof(ws_clients[client_id].command_buffer) - ws_clients[client_id].command_len - 1;
-            if (available >= command_length) {
-                 strncat(ws_clients[client_id].command_buffer, data, command_length);
-                 ws_clients[client_id].command_len += command_length;
-                 ws_clients[client_id].command_buffer[ws_clients[client_id].command_len] = '\0';
-                 command_to_run = ws_clients[client_id].command_buffer; // Use buffer, NO free
-                 run_len = ws_clients[client_id].command_len;
-                 ESP_LOGI(TAG, "Executing accumulated+new command (len: %d)", (int)run_len);
+    // === Character by Character Processing ===
+    size_t command_start_index = 0; // Start index of pending chars in current `data` frame
+
+    for (size_t i = 0; i < len; ++i) {
+        char current_char = data[i];
+        bool is_newline = (current_char == '\r' || current_char == '\n');
+        bool is_backspace = (current_char == '\b' || current_char == 0x7f);
+
+        if (is_backspace) {
+            // Echo effect: Send backspace-space-backspace
+            send_ws_text_frame(sockfd, "\b \b"); 
+            // Handle buffer
+            if (client->command_len > 0) {
+                client->command_len--;
+                // Ensure buffer is null-terminated after backspace
+                if(client->command_buffer) client->command_buffer[client->command_len] = '\0';
             } else {
-                  ESP_LOGW(TAG, "Command buffer overflow for client %d", client_id);
-                  send_ws_text_frame(sockfd, "\r\nCommand too long\r\n>>> ");
+                 // Maybe beep or ignore if buffer already empty?
             }
-        }
+            command_start_index = i + 1; // Discard the character for accumulation purposes
+        } else if (is_newline) {
+            // Echo newline
+            send_ws_text_frame(sockfd, "\r\n"); 
 
-        // Execute if we have a command
-        if (command_to_run && run_len > 0) {
-             // ===> Set stream for execution <===
-             int original_stream_sockfd = g_stream_sockfd;
-             g_stream_sockfd = sockfd;
-             ESP_LOGD(TAG, "Set stream sockfd to %d for client %d execution", g_stream_sockfd, client_id);
+            // 1. Append pending characters before the newline
+            size_t chars_to_append = i - command_start_index;
+            if (chars_to_append > 0) {
+                size_t needed_len = client->command_len + chars_to_append + 1; // +1 for null terminator
+                // Resize buffer if needed
+                if (client->buffer_capacity < needed_len) {
+                    size_t new_capacity = (client->buffer_capacity == 0) ? 256 : client->buffer_capacity * 2;
+                    while (new_capacity < needed_len) new_capacity *= 2;
+                    char *new_buffer = realloc(client->command_buffer, new_capacity);
+                    if (!new_buffer) {
+                        ESP_LOGE(TAG, "Failed to realloc command buffer (append) for client %d", client_id);
+                        // Consider sending error, clearing state? For now, just log.
+                        client->command_len = 0; // Reset length
+                        if (client->command_buffer) client->command_buffer[0] = '\0';
+                        command_start_index = i + 1;
+                        continue; // Skip execution attempt
+                    }
+                    client->command_buffer = new_buffer;
+                    client->buffer_capacity = new_capacity;
+                }
+                // Append the actual data
+                memcpy(client->command_buffer + client->command_len, &data[command_start_index], chars_to_append);
+                client->command_len += chars_to_append;
+                client->command_buffer[client->command_len] = '\0'; // Null terminate
+            }
             
-             _be_webrepl_run_code(vm, client_id, sockfd, command_to_run, run_len);
-             
-             // ===> Restore stream sockfd <===
-             g_stream_sockfd = original_stream_sockfd;
-             ESP_LOGD(TAG, "Restored stream sockfd to %d after client %d execution", g_stream_sockfd, client_id);
-        }
-        
-        // Reset buffer after execution
-        ws_clients[client_id].command_len = 0;
-        ws_clients[client_id].command_buffer[0] = '\0';
+            // 2. Execute or send prompt
+            if (client->command_len > 0) {
+                 ESP_LOGD(TAG, "Executing accumulated command (len %d):\n---BEGIN---\n%s\n---END---", 
+                          (int)client->command_len, client->command_buffer ? client->command_buffer : "<NULL>");
+                 
+                 // ===> Set stream for execution <===
+                 int original_stream_sockfd = g_stream_sockfd;
+                 g_stream_sockfd = sockfd;
+                 
+                 int exec_result = _be_webrepl_attempt_execute(vm, client->command_buffer, client->command_len);
+                 
+                 // ===> Restore stream sockfd <===
+                 g_stream_sockfd = original_stream_sockfd;
 
-    } 
-    else {
-        // Accumulate characters (friendly mode, no line ending yet)
-        if (!ws_clients[client_id].raw_repl_mode) {
-            send_ws_text_frame(sockfd, data); // Echo
-        }
-        size_t available = sizeof(ws_clients[client_id].command_buffer) - ws_clients[client_id].command_len - 1;
-        if (available > 0) {
-            size_t chars_to_copy = len < available ? len : available;
-            strncat(ws_clients[client_id].command_buffer, data, chars_to_copy);
-            ws_clients[client_id].command_len += chars_to_copy;
-            ws_clients[client_id].command_buffer[ws_clients[client_id].command_len] = '\0';
-            ESP_LOGD(TAG, "Accumulated command so far: '%s' (len: %d)", 
-                   ws_clients[client_id].command_buffer, ws_clients[client_id].command_len);
-        } else {
-            ESP_LOGW(TAG, "Command buffer overflow for client %d", client_id);
-            send_ws_text_frame(sockfd, "\r\nCommand too long\r\n>>> ");
-            ws_clients[client_id].command_len = 0;
-            ws_clients[client_id].command_buffer[0] = '\0';
+                 ESP_LOGI(TAG, "Execution attempt result for client %d: %d", client_id, exec_result);
+                 _be_webrepl_send_result(vm, client_id, sockfd, exec_result); // Send result/error/prompt
+
+                 // Clear buffer after execution attempt
+                 client->command_len = 0;
+                 if (client->command_buffer) client->command_buffer[0] = '\0';
+            } else {
+                 // Empty line entered, just send prompt
+                 send_ws_text_frame(sockfd, ">>> ");
+            }
+
+            // Handle CRLF sequence
+            if (current_char == '\r' && (i + 1 < len) && data[i + 1] == '\n') {
+                i++; // Skip the following LF
+            }
+            command_start_index = i + 1; // Next chunk starts after the newline(s)
+
+        } else { // Regular character
+             // Echo back ONLY if the frame contained just this single character
+             if (len == 1) { 
+                 char echo_buf[2] = { current_char, '\0' };
+                 send_ws_text_frame(sockfd, echo_buf);
+             }
+             // Accumulation will happen when newline is hit or at end of frame
         }
     }
+
+    // === Append any remaining characters after the loop (no newline in this frame) ===
+    size_t remaining_chars = len - command_start_index;
+    if (remaining_chars > 0) {
+        size_t needed_len = client->command_len + remaining_chars + 1; // +1 for null terminator
+        // Resize buffer if needed
+        if (client->buffer_capacity < needed_len) {
+             size_t new_capacity = (client->buffer_capacity == 0) ? 256 : client->buffer_capacity * 2;
+             while (new_capacity < needed_len) new_capacity *= 2;
+             char *new_buffer = realloc(client->command_buffer, new_capacity);
+             if (!new_buffer) {
+                  ESP_LOGE(TAG, "Failed to realloc command buffer (tail append) for client %d", client_id);
+                  client->command_len = 0; // Reset length
+                  if (client->command_buffer) client->command_buffer[0] = '\0';
+                  // Skip append if realloc fails
+                  return; 
+             }
+             client->command_buffer = new_buffer;
+             client->buffer_capacity = new_capacity;
+        }
+        // Append remaining data
+        memcpy(client->command_buffer + client->command_len, &data[command_start_index], remaining_chars);
+        client->command_len += remaining_chars;
+        client->command_buffer[client->command_len] = '\0'; // Null terminate
+        ESP_LOGD(TAG, "Appended %d tail chars. Buffer len %d: '%s'", 
+                 (int)remaining_chars, (int)client->command_len, client->command_buffer ? client->command_buffer : "<NULL>");
+    }
+
     ESP_LOGD(TAG, "REPL Input Handler End: Client %d", client_id);
 }
-
-// REMOVED: Obsolete activation function
-// Called by w_wsserver_send when the password prompt is detected
-// void be_webrepl_activate_password_mode(int client_slot) { ... }
-
 
 #endif // USE_BERRY_WEBREPL 
