@@ -348,131 +348,154 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
     }
     ESP_LOGD(TAG,"Binary Handle End: Client %d", client_id);
 }
-// --- END ADDED Binary Handling Functions ---
 
-// <<< NEW Combined Function >>>
-static void _be_webrepl_execute_and_send(bvm *vm, int client_id, int client_sockfd, const char* code, size_t len) {
-    int initial_top = be_top(vm);
-    int ret_code; // Final status code
-    bool executed = false; // Flag to track if pcall was attempted
 
-    char response_buffer[1024] = {0};
-    const char* prompt = ">>> ";
-    const char* newline = "\r\n";
 
-    ESP_LOGD(TAG, "ExecuteAndSend: Initial Top: %d", initial_top);
+// be_repl.c's is_multline function
+static bbool is_multline(bvm *vm) {
+    const char *msg = be_tostring(vm, -1);
+    size_t len = strlen(msg);
+    if (len > 5) {  // Multi-line text if the error message is 'EOS' at the end
+        return !strcmp(msg + len - 5, "'EOS'");
+    }
+    return bfalse;
+}
 
-    // 1. Try loading as statement
-    ESP_LOGD(TAG, "ExecuteAndSend: Attempting to load as statement");
-    ret_code = be_loadbuffer(vm, "webrepl", code, len);
+// be_repl.c's try_return function
+static int try_return(bvm *vm, const char *line) {
+    int res, idx;
+    line = be_pushfstring(vm, "return (%s)", line);
+    idx = be_absindex(vm, -1);  // Get the source text absolute index
+    res = be_loadbuffer(vm, "webrepl", line, strlen(line));  // Compile line
+    be_remove(vm, idx);  // Remove source string
+    return res;
+}
+
+// cf be_repl.c's compile function
+static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
+    int res = try_return(vm, client->command_buffer);
     
-    // 2. If statement syntax error, try as expression
-    if (be_getexcept(vm, ret_code) == BE_SYNTAX_ERROR) {
-        ESP_LOGD(TAG, "ExecuteAndSend: Load as statement failed (Syntax Error %d), trying as expression", ret_code);
-        be_pop(vm, 2); // Pop statement syntax error items
-
-        // Format expression: return (...)
-        size_t expr_len = len + 10; 
-        char *expr = malloc(expr_len);
-        if (expr) {
-            // Strip trailing newline(s)
-            int expr_code_len = len;
-            if (expr_code_len > 0 && code[expr_code_len - 1] == '\n') {
-                expr_code_len--;
-                if (expr_code_len > 0 && code[expr_code_len - 1] == '\r') {
-                    expr_code_len--;
-                }
-            }
-            // Format and try loading the expression
-            int written = snprintf(expr, expr_len, "return (%.*s)", expr_code_len, code);
-            if (written > 0 && written < expr_len) {
-                ESP_LOGD(TAG, "ExecuteAndSend: Trying as expression: '%s'", expr);
-                ret_code = be_loadbuffer(vm, "webrepl", expr, written); // Overwrite ret_code
-            } else {
-                 ret_code = BE_EXEC_ERROR;
-                 ESP_LOGE(TAG, "ExecuteAndSend: Failed to format expression string");
-            }
-            free(expr);
-        } else {
-            ret_code = BE_MALLOC_FAIL;
-            ESP_LOGE(TAG, "ExecuteAndSend: Failed to allocate memory for expression");
+    if (be_getexcept(vm, res) == BE_SYNTAX_ERROR) {
+        be_pop(vm, 2);  // Pop exception values
+        
+        // Push the current buffer as source
+        be_pushstring(vm, client->command_buffer);
+        
+        // If we're not already in multi-line mode, reset the buffer
+        if (!client->in_multiline) {
+            client->command_len = 0;
+            client->command_buffer[0] = '\0';
         }
-        // If expression load fails, ret_code holds the error, error items are on stack
-    } else if (ret_code != BE_OK) {
-         ESP_LOGE(TAG, "ExecuteAndSend: Load as statement failed (Non-syntax %d)", ret_code);
-         // Non-syntax load error, ret_code holds error, error items are on stack
-    }
-
-    // 3. Execute if load was successful
-    if (ret_code == BE_OK) {
-        ESP_LOGD(TAG, "ExecuteAndSend: Code loaded successfully, executing");
-        ret_code = be_pcall(vm, 0); // Overwrite ret_code with pcall result (BE_OK or BE_EXCEPTION)
-        executed = true;
-    }
-
-    ESP_LOGD(TAG, "ExecuteAndSend: Final ret_code: %d. Stack top before formatting: %d", ret_code, be_top(vm));
-
-    // 4. Format response based on final ret_code
-    int items_to_pop = 0;
-    if (ret_code == BE_OK) {
-        // Execution successful
-        if (be_top(vm) > initial_top) { // Check if pcall left a value
-            if (be_isnil(vm, -1)) {
-                // Result is nil - just format prompt
-                snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
-                items_to_pop = 1; // Pop the nil
-            } else {
-                // Use be_tostring to get the result representation (mirroring CmndBrRun)
-                const char *result_str = be_tostring(vm, -1); 
-                snprintf(response_buffer, sizeof(response_buffer), "%s%s%s",
-                         result_str ? result_str : "<err_str>", newline, prompt); // Format result + newline + prompt
-                
-                // Mark original result for popping
-                items_to_pop = 1; 
-            }
-        } else {
-            ESP_LOGW(TAG, "ExecuteAndSend: Stack top same as initial after BE_OK!");
-            snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
-            items_to_pop = 0; // Nothing to pop
-        }
-    } else { // Error occurred (load or pcall exception)
-        if (be_top(vm) >= initial_top + 1) { // Expect at least 1 error item
-            const char *error_str = be_tostring(vm, -1); // Error message is usually top
-            snprintf(response_buffer, sizeof(response_buffer), "%sError: %s%s%s",
-                     newline, error_str ? error_str : "<unknown_err>", newline, prompt);
+        
+        for (;;) {
+            const char *src = be_tostring(vm, -1);  // Get source code
+            int idx = be_absindex(vm, -1);  // Get source text absolute index
             
-            // Pop error items (Assume 2 based on CmndBrRun for SYNTAX/EXCEPTION?)
-            int expected_items = (ret_code == BE_SYNTAX_ERROR || ret_code == BE_EXCEPTION) ? 2 : 1;
-            items_to_pop = (be_top(vm) - initial_top >= expected_items) ? expected_items : (be_top(vm) - initial_top);
-            ESP_LOGD(TAG, "ExecuteAndSend: Error %d, popping %d items (expected %d based on code)", ret_code, items_to_pop, expected_items);
-
-        } else {
-            ESP_LOGW(TAG, "ExecuteAndSend: Stack top same as initial after error %d!", ret_code);
-            snprintf(response_buffer, sizeof(response_buffer), "%sError: Unknown error (%d)%s%s",
-                     newline, ret_code, newline, prompt);
+            // Compile source line
+            res = be_loadbuffer(vm, "webrepl", src, strlen(src));
+            
+            if (!res || !is_multline(vm)) {
+                be_remove(vm, idx);  // Remove source code
+                
+                // If compilation succeeded or it's not a multi-line error, exit loop
+                if (!client->in_multiline) {
+                    // Send normal prompt for next input
+                    send_ws_text_frame(sockfd, ">>> ");
+                }
+                return res;
+            }
+            
+            // Multi-line case: need more input
+            be_pop(vm, 2);  // Pop exception values
+            
+            // Set multi-line flag if not already set
+            client->in_multiline = true;
+            
+            // Send continuation prompt
+            send_ws_text_frame(sockfd, "... ");
+            
+            // Unlike be_repl.c, we can't call getline() here to get more input.
+            // Instead, we need to save the current state and wait for more data.
+            // We'll append a newline for continuation when we return.
+            be_pushfstring(vm, "\n");
+            be_strconcat(vm, -2);  // Concatenate newline with source
+            be_pop(vm, 1);  // Pop newline
+            
+            // Note: For WebREPL, we're saving partial state and will continue
+            // when more data arrives in a future call to be_webrepl_handle_input.
+            // This is a fundamental difference from the synchronous REPL.
+            return BE_OK;  // Return success to indicate we're waiting for more input
         }
     }
-
-    // Pop result/error items from stack
-    if (items_to_pop > 0) {
-        ESP_LOGD(TAG, "ExecuteAndSend: Popping %d items from stack", items_to_pop);
-        be_pop(vm, items_to_pop);
+    
+    // Not a syntax error or multi-line case
+    if (res == BE_OK) {
+        // Send normal prompt for next input since compilation succeeded
+        send_ws_text_frame(sockfd, ">>> ");
     }
+    
+    // Reset buffer if compilation succeeded or failed with non-syntax error
+    client->command_len = 0;
+    client->command_buffer[0] = '\0';
+    client->in_multiline = false;
+    
+    return res;
+}
 
-    // 5. Send response
-    if (client_sockfd >= 0) {
-        ESP_LOGD(TAG, "ExecuteAndSend: Sending response to client %d (socket %d): '%s'", 
-                client_id, client_sockfd, response_buffer);
-        send_ws_text_frame(client_sockfd, response_buffer);
-    } else {
-         ESP_LOGE(TAG, "ExecuteAndSend: Invalid socket (%d) for client %d, can't send response", client_sockfd, client_id);
+// cf be_repl.c's call_script function
+static int webrepl_call_script(bvm *vm, int sockfd) {
+    int res = be_pcall(vm, 0);  // Call the main function
+    
+    switch (res) {
+        case BE_OK:  // Execution succeeded
+            if (!be_isnil(vm, -1)) {  // Print return value when it's not nil
+                be_dumpvalue(vm, -1);
+            }
+            be_pop(vm, 1);  // Pop the result value
+            break;
+            
+        case BE_EXCEPTION:  // VM run error
+            be_dumpexcept(vm);
+            be_pop(vm, 1);  // Pop the function value
+            break;
+            
+        default:  // BE_EXIT or BE_MALLOC_FAIL
+            return res;
     }
+    
+    return 0;
+}
 
-    // 6. Final stack check (optional)
-    if (be_top(vm) != initial_top) { 
-         ESP_LOGE(TAG, "ExecuteAndSend: Stack imbalance after sending! Top: %d, Expected: %d (Original: %d, Popped: %d)",
-                 client_id, be_top(vm), initial_top, initial_top, items_to_pop);
+// Helper function for buffer management (WebREPL specific)
+static bool ensure_command_buffer(ws_client_t *client, size_t additional_len) {
+    if (!client) return false;
+    
+    // Calculate required capacity
+    size_t required_capacity = client->command_len + additional_len;
+    
+    // Check if we need to allocate or resize
+    if (!client->command_buffer) {
+        // First allocation, provide reasonable starting size
+        size_t initial_capacity = required_capacity > 256 ? required_capacity : 256;
+        client->command_buffer = malloc(initial_capacity);
+        if (!client->command_buffer) return false;
+        client->buffer_capacity = initial_capacity;
+        client->command_len = 0;
+        client->command_buffer[0] = '\0';
+        client->in_multiline = false;
+    } else if (client->buffer_capacity < required_capacity) {
+        // Need to resize
+        size_t new_capacity = client->buffer_capacity * 2;
+        while (new_capacity < required_capacity) new_capacity *= 2;
+        
+        char *new_buffer = realloc(client->command_buffer, new_capacity);
+        if (!new_buffer) return false;
+        
+        client->command_buffer = new_buffer;
+        client->buffer_capacity = new_capacity;
     }
+    
+    return true;
 }
 
 // Handles all incoming data for a client in REPL mode
@@ -483,145 +506,114 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                  vm, data, client_id);
         return;
     }
-
-    ws_client_t *client = &ws_clients[client_id]; // Get client struct pointer
-    int sockfd = client->sockfd;
+    if (!is_client_valid(client_id)) {
+        ESP_LOGE(TAG, "Invalid client %d in be_webrepl_handle_input", client_id);
+        return;
+    }
+    int sockfd = ws_clients[client_id].sockfd;
     if (sockfd < 0) {
         ESP_LOGE(TAG, "Invalid sockfd for client %d in be_webrepl_handle_input", client_id);
-        return; // Can't proceed without a valid socket
-    }
-
-    ESP_LOGD(TAG, "REPL Input Handler Start: Client %d, Socket %d, State = %d, Len = %d", 
-             client_id, sockfd, client->state, (int)len);
-
-    // --- Handle Ctrl+C --- 
-    if (len == 1 && data[0] == 0x03) { // Ctrl+C
-        ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
-        if (client->command_buffer) { // Clear buffer if allocated
-            client->command_len = 0;
-            client->command_buffer[0] = '\0';
-        }
-        send_ws_text_frame(sockfd, "\r\n>>> "); // Send prompt
-        ESP_LOGD(TAG, "REPL Input Handler End (Ctrl+C): Client %d", client_id);
         return;
     }
 
-    // === Character by Character Processing eg for WebREPL client ===
-    size_t command_start_index = 0; // Start index of pending chars in current `data` frame
+    ESP_LOGD(TAG, "REPL Input Handler: Client %d, Socket %d, Data len = %d", 
+             client_id, sockfd, (int)len);
 
-    for (size_t i = 0; i < len; ++i) {
-        char current_char = data[i];
-        bool is_newline = (current_char == '\r' || current_char == '\n');
-        bool is_backspace = (current_char == '\b' || current_char == 0x7f);
+    // --- Handle special control characters ---
+    if (len == 1 && data[0] == 0x03) { // Ctrl+C
+        ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
+        
+        // Reset the client's command buffer if it exists
+        ws_client_t *client = &ws_clients[client_id];
+        if (client->command_buffer) {
+            client->command_len = 0;
+            client->command_buffer[0] = '\0';
+            client->in_multiline = false;
+        }
+        
+        // Send prompt
+        send_ws_text_frame(sockfd, "\r\n>>> ");
+        return;
+    }
 
-        if (is_backspace) {
-            // Echo effect: Send backspace-space-backspace
-            send_ws_text_frame(sockfd, "\b \b"); 
-            // Handle buffer
-            if (client->command_len > 0) {
-                client->command_len--;
-                // Ensure buffer is null-terminated after backspace
-                if(client->command_buffer) client->command_buffer[client->command_len] = '\0';
-            } else {
-                 // Maybe beep or ignore if buffer already empty?
-            }
-            command_start_index = i + 1; // Discard the character for accumulation purposes
-        } else if (is_newline) {
-            // Echo newline
-            send_ws_text_frame(sockfd, "\r\n"); 
-
-            // 1. Append pending characters before the newline
-            size_t chars_to_append = i - command_start_index;
-            if (chars_to_append > 0) {
-                size_t needed_len = client->command_len + chars_to_append + 1; // +1 for null terminator
-                // Resize buffer if needed
-                if (client->buffer_capacity < needed_len) {
-                    size_t new_capacity = (client->buffer_capacity == 0) ? 256 : client->buffer_capacity * 2;
-                    while (new_capacity < needed_len) new_capacity *= 2;
-                    char *new_buffer = realloc(client->command_buffer, new_capacity);
-                    if (!new_buffer) {
-                        ESP_LOGE(TAG, "Failed to realloc command buffer (append) for client %d", client_id);
-                        // Consider sending error, clearing state? For now, just log.
-                        client->command_len = 0; // Reset length
-                        if (client->command_buffer) client->command_buffer[0] = '\0';
-                        command_start_index = i + 1;
-                        continue; // Skip execution attempt
-                    }
-                    client->command_buffer = new_buffer;
-                    client->buffer_capacity = new_capacity;
-                }
-                // Append the actual data
-                memcpy(client->command_buffer + client->command_len, &data[command_start_index], chars_to_append);
-                client->command_len += chars_to_append;
-                client->command_buffer[client->command_len] = '\0'; // Null terminate
+    // Process input TEXT frame from ws line by line
+    ws_client_t *client = &ws_clients[client_id];
+    const char *current = data;
+    const char *end = data + len;
+    int initial_top = be_top(vm);
+    
+    while (current < end) {
+        // Find the next line terminator
+        const char *line_end = current;
+        while (line_end < end && *line_end != '\r' && *line_end != '\n') {
+            line_end++;
+        }
+        
+        // Process this line if it's not empty
+        size_t line_len = line_end - current;
+        if (line_len > 0 || (line_end < end)) {  // Non-empty line or empty line with terminator
+            // Ensure command buffer has enough space
+            if (!ensure_command_buffer(client, line_len + 2)) {  // +2 for newline and null terminator
+                ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
+                return;
             }
             
-            // 2. Execute or send prompt
-            if (client->command_len > 0) {
-                 ESP_LOGD(TAG, "Executing accumulated command (len %d):\n---BEGIN---\n%s\n---END---", 
-                          (int)client->command_len, client->command_buffer ? client->command_buffer : "<NULL>");
-                 
-                 // ===> Set stream for execution <===
-                 int original_stream_sockfd = g_stream_sockfd;
-                 g_stream_sockfd = sockfd;
-                 
-                 _be_webrepl_execute_and_send(vm, client_id, sockfd, client->command_buffer, client->command_len);
-                 
-                 // ===> Restore stream sockfd <===
-                 g_stream_sockfd = original_stream_sockfd;
-
-                 // Clear buffer after execution attempt
-                 client->command_len = 0;
-                 if (client->command_buffer) client->command_buffer[0] = '\0';
+            // Append line to buffer
+            if (line_len > 0) {
+                memcpy(client->command_buffer + client->command_len, current, line_len);
+                client->command_len += line_len;
+                client->command_buffer[client->command_len] = '\0';
+            }
+            
+            // If we have a line terminator, process the command
+            if (line_end < end && (*line_end == '\r' || *line_end == '\n')) {
+                // Echo newline
+                send_ws_text_frame(sockfd, "\r\n");
+                
+                // Redirect output to WebSocket during execution
+                int original_stream_sockfd = g_stream_sockfd;
+                g_stream_sockfd = sockfd;
+                
+                // Exact pattern from be_repl.c: Compile then call script if successful
+                int res = webrepl_compile(vm, client, sockfd);
+                
+                if (res == BE_MALLOC_FAIL) {
+                    ESP_LOGE(TAG, "Memory allocation failure during compilation");
+                } else if (res) {
+                    // Compilation error
+                    be_dumpexcept(vm);
+                } else {
+                    // Compiled successfully, execute it
+                    res = webrepl_call_script(vm, sockfd);
+                    if (res) {
+                        ESP_LOGE(TAG, "Execution error: %d", res);
+                    }
+                }
+                
+                // Restore original output stream
+                g_stream_sockfd = original_stream_sockfd;
+                
+                // Skip past line terminator(s)
+                current = line_end + 1;
+                if (current < end && *line_end == '\r' && *current == '\n') {
+                    current++;  // Skip LF in CRLF sequence
+                }
             } else {
-                 // Empty line entered, just send prompt
-                 send_ws_text_frame(sockfd, ">>> ");
+                // No line terminator, means we've processed all data
+                current = line_end;
             }
-
-            // Handle CRLF sequence
-            if (current_char == '\r' && (i + 1 < len) && data[i + 1] == '\n') {
-                i++; // Skip the following LF
-            }
-            command_start_index = i + 1; // Next chunk starts after the newline(s)
-
-        } else { // Regular character
-             // Echo back ONLY if the frame contained just this single character
-             if (len == 1) { 
-                 char echo_buf[2] = { current_char, '\0' };
-                 send_ws_text_frame(sockfd, echo_buf);
-             }
-             // Accumulation will happen when newline is hit or at end of frame
+        } else {
+            // Skip empty content with no terminator
+            current = line_end;
         }
     }
-
-    // === Append any remaining characters after the loop (no newline in this frame) ===
-    size_t remaining_chars = len - command_start_index;
-    if (remaining_chars > 0) {
-        size_t needed_len = client->command_len + remaining_chars + 1; // +1 for null terminator
-        // Resize buffer if needed
-        if (client->buffer_capacity < needed_len) {
-             size_t new_capacity = (client->buffer_capacity == 0) ? 256 : client->buffer_capacity * 2;
-             while (new_capacity < needed_len) new_capacity *= 2;
-             char *new_buffer = realloc(client->command_buffer, new_capacity);
-             if (!new_buffer) {
-                  ESP_LOGE(TAG, "Failed to realloc command buffer (tail append) for client %d", client_id);
-                  client->command_len = 0; // Reset length
-                  if (client->command_buffer) client->command_buffer[0] = '\0';
-                  // Skip append if realloc fails
-                  return; 
-             }
-             client->command_buffer = new_buffer;
-             client->buffer_capacity = new_capacity;
-        }
-        // Append remaining data
-        memcpy(client->command_buffer + client->command_len, &data[command_start_index], remaining_chars);
-        client->command_len += remaining_chars;
-        client->command_buffer[client->command_len] = '\0'; 
-        ESP_LOGD(TAG, "Appended %d tail chars. Buffer len %d: '%s'", 
-                 (int)remaining_chars, (int)client->command_len, client->command_buffer ? client->command_buffer : "<NULL>");
+    
+    // Check for stack balance
+    if (be_top(vm) != initial_top) {
+        ESP_LOGE(TAG, "Stack imbalance after REPL handling! Top: %d, Expected: %d",
+                 be_top(vm), initial_top);
+        be_pop(vm, be_top(vm) - initial_top);  // Restore stack balance
     }
-
-    ESP_LOGD(TAG, "REPL Input Handler End: Client %d", client_id);
 }
 
 #endif // USE_BERRY_WEBREPL 
