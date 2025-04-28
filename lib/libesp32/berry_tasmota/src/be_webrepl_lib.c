@@ -350,29 +350,32 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
 }
 // --- END ADDED Binary Handling Functions ---
 
-// <<< NEW FUNCTION: Attempts to load and execute Berry code >>> - Implementation stays here
-static int _be_webrepl_attempt_execute(bvm *vm, const char* code, size_t len) {
+// <<< NEW Combined Function >>>
+static void _be_webrepl_execute_and_send(bvm *vm, int client_id, int client_sockfd, const char* code, size_t len) {
     int initial_top = be_top(vm);
-    int result;
-    bool loaded = false;
+    int ret_code; // Final status code
+    bool executed = false; // Flag to track if pcall was attempted
 
-    // 1. Try as statement
-    ESP_LOGD(TAG, "Attempting to load code as statement");
-    result = be_loadbuffer(vm, "webrepl", code, len);
+    char response_buffer[1024] = {0};
+    const char* prompt = ">>> ";
+    const char* newline = "\r\n";
+
+    ESP_LOGD(TAG, "ExecuteAndSend: Initial Top: %d", initial_top);
+
+    // 1. Try loading as statement
+    ESP_LOGD(TAG, "ExecuteAndSend: Attempting to load as statement");
+    ret_code = be_loadbuffer(vm, "webrepl", code, len);
     
-    if (result == BE_OK) {
-        // Statement loaded OK
-        loaded = true;
-    } else if (be_getexcept(vm, result) == BE_SYNTAX_ERROR) {
-        // Statement syntax error -> try as expression
-        ESP_LOGD(TAG, "Load as statement failed (Syntax Error), trying as expression");
-        be_pop(vm, 2); // Pop statement syntax error items (assuming 2 based on CmndBrRun)
+    // 2. If statement syntax error, try as expression
+    if (be_getexcept(vm, ret_code) == BE_SYNTAX_ERROR) {
+        ESP_LOGD(TAG, "ExecuteAndSend: Load as statement failed (Syntax Error %d), trying as expression", ret_code);
+        be_pop(vm, 2); // Pop statement syntax error items
 
         // Format expression: return (...)
-        size_t expr_len = len + 10; // "return ()"
+        size_t expr_len = len + 10; 
         char *expr = malloc(expr_len);
         if (expr) {
-            // Strip trailing newline(s) for the expression body
+            // Strip trailing newline(s)
             int expr_code_len = len;
             if (expr_code_len > 0 && code[expr_code_len - 1] == '\n') {
                 expr_code_len--;
@@ -380,119 +383,95 @@ static int _be_webrepl_attempt_execute(bvm *vm, const char* code, size_t len) {
                     expr_code_len--;
                 }
             }
-
+            // Format and try loading the expression
             int written = snprintf(expr, expr_len, "return (%.*s)", expr_code_len, code);
             if (written > 0 && written < expr_len) {
-                ESP_LOGD(TAG, "Trying as expression: '%s'", expr);
-                result = be_loadbuffer(vm, "webrepl", expr, written); // Try loading expression
-                if (result == BE_OK) {
-                    loaded = true; // Expression loaded OK
-                } else {
-                    // Expression load failed (Syntax or other error)
-                    ESP_LOGE(TAG, "Load as expression failed: %d", result);
-                    // Error object is on stack. Leave it for the caller.
-                    loaded = false;
-                }
+                ESP_LOGD(TAG, "ExecuteAndSend: Trying as expression: '%s'", expr);
+                ret_code = be_loadbuffer(vm, "webrepl", expr, written); // Overwrite ret_code
             } else {
-                 result = BE_EXEC_ERROR; // Indicate failure if snprintf failed
-                 loaded = false;
-                 ESP_LOGE(TAG, "Failed to format expression string");
+                 ret_code = BE_EXEC_ERROR;
+                 ESP_LOGE(TAG, "ExecuteAndSend: Failed to format expression string");
             }
             free(expr);
         } else {
-            ESP_LOGE(TAG, "Failed to allocate memory for expression");
-            result = BE_MALLOC_FAIL; 
-            loaded = false;
+            ret_code = BE_MALLOC_FAIL;
+            ESP_LOGE(TAG, "ExecuteAndSend: Failed to allocate memory for expression");
         }
-    } else {
-        // Statement load failed (Non-syntax error, e.g., memory)
-        ESP_LOGE(TAG, "Load as statement failed (Non-syntax): %d", result);
-        // Error object is on stack. Leave it for the caller.
-        loaded = false;
-    }
-    
-    // 2. Execute if loaded successfully
-    if (loaded) {
-        ESP_LOGD(TAG, "Code loaded successfully, executing");
-        result = be_pcall(vm, 0); // Can return BE_OK or BE_EXCEPTION
-        // If BE_OK, result value is on stack.
-        // If BE_EXCEPTION, error object (presumably 2 items) is on stack.
+        // If expression load fails, ret_code holds the error, error items are on stack
+    } else if (ret_code != BE_OK) {
+         ESP_LOGE(TAG, "ExecuteAndSend: Load as statement failed (Non-syntax %d)", ret_code);
+         // Non-syntax load error, ret_code holds error, error items are on stack
     }
 
-    // 3. Final result determination
-    // The stack should contain: result value (if BE_OK), or error object(s) otherwise.
-    // This is handled by _be_webrepl_send_result.
-    // No explicit stack cleanup needed here anymore.
+    // 3. Execute if load was successful
+    if (ret_code == BE_OK) {
+        ESP_LOGD(TAG, "ExecuteAndSend: Code loaded successfully, executing");
+        ret_code = be_pcall(vm, 0); // Overwrite ret_code with pcall result (BE_OK or BE_EXCEPTION)
+        executed = true;
+    }
 
-    return result; // Return the final status (BE_OK, BE_EXCEPTION, or Load Error code)
-}
+    ESP_LOGD(TAG, "ExecuteAndSend: Final ret_code: %d. Stack top before formatting: %d", ret_code, be_top(vm));
 
-// <<< NEW FUNCTION: Formats and sends REPL response/error >>> - Implementation stays here
-static void _be_webrepl_send_result(bvm *vm, int client_id, int client_sockfd, int exec_result) {
-    char response_buffer[1024] = {0};
-    const char* prompt = ">>> ";
-    const char* newline = "\r\n";
-    int original_top = be_top(vm); // Capture top BEFORE processing result/error
-    int items_to_pop = 0; // How many items to pop at the end
-
-    if (exec_result == BE_OK) {
-        // Handle successful execution result
-        if (original_top > 0) { // Check if stack has at least one item (the result)
-            int result_index = -1; // Use relative index from top
-            if (be_isnil(vm, result_index)) {
+    // 4. Format response based on final ret_code
+    int items_to_pop = 0;
+    if (ret_code == BE_OK) {
+        // Execution successful
+        if (be_top(vm) > initial_top) { // Check if pcall left a value
+            if (be_isnil(vm, -1)) {
+                // Result is nil - just format prompt
                 snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
+                items_to_pop = 1; // Pop the nil
             } else {
-                const char *result_str = be_tostring(vm, result_index); 
-                if (result_str) {
-                    snprintf(response_buffer, sizeof(response_buffer), "%s%s%s%s", 
-                             newline, result_str, newline, prompt);
-                } else {
-                    ESP_LOGW(TAG, "Failed to convert result to string for client %d", client_id);
-                    snprintf(response_buffer, sizeof(response_buffer),  "%s%s", newline, prompt);
-                }
+                // Use be_tostring to get the result representation (mirroring CmndBrRun)
+                const char *result_str = be_tostring(vm, -1); 
+                snprintf(response_buffer, sizeof(response_buffer), "%s%s%s",
+                         result_str ? result_str : "<err_str>", newline, prompt); // Format result + newline + prompt
+                
+                // Mark original result for popping
+                items_to_pop = 1; 
             }
-            items_to_pop = 1; // Pop the single result value
         } else {
-             ESP_LOGW(TAG, "Stack unexpectedly empty after BE_OK in _be_webrepl_send_result for client %d!", client_id);
-             snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
-             items_to_pop = 0;
+            ESP_LOGW(TAG, "ExecuteAndSend: Stack top same as initial after BE_OK!");
+            snprintf(response_buffer, sizeof(response_buffer), "%s%s", newline, prompt);
+            items_to_pop = 0; // Nothing to pop
         }
-    } else { // Any error (BE_SYNTAX_ERROR, BE_EXCEPTION, etc.)
-        ESP_LOGD(TAG, "SendResult Error (%d): Original Top: %d", exec_result, original_top);
-        if (original_top >= 1) { // Assume at least one error item (message)
-             const char *error_str = be_tostring(vm, -1); // Get message from top
-             // Optional: Log the item below the top if expected
-             // if (original_top >= 2) { const char *prev_str = be_tostring(vm, -2); ESP_LOGD(TAG, "Item below top: %s", prev_str?prev_str:"<nil>"); }
-             snprintf(response_buffer, sizeof(response_buffer), "%sError: %s%s%s", 
-                     newline, error_str ? error_str : "Unknown error", newline, prompt);
-             items_to_pop = (original_top >= 2) ? 2 : 1; // Pop 2 if available based on reference, else 1
-             ESP_LOGD(TAG, "SendResult Error: Popping %d items", items_to_pop);
-        } else {
-             ESP_LOGW(TAG, "Stack unexpectedly empty after ERROR (%d) in _be_webrepl_send_result for client %d!", exec_result, client_id);
-             snprintf(response_buffer, sizeof(response_buffer), "%sError: Unknown error%s%s", newline, newline, prompt);
-             items_to_pop = 0;
-        }
-    }
+    } else { // Error occurred (load or pcall exception)
+        if (be_top(vm) >= initial_top + 1) { // Expect at least 1 error item
+            const char *error_str = be_tostring(vm, -1); // Error message is usually top
+            snprintf(response_buffer, sizeof(response_buffer), "%sError: %s%s%s",
+                     newline, error_str ? error_str : "<unknown_err>", newline, prompt);
+            
+            // Pop error items (Assume 2 based on CmndBrRun for SYNTAX/EXCEPTION?)
+            int expected_items = (ret_code == BE_SYNTAX_ERROR || ret_code == BE_EXCEPTION) ? 2 : 1;
+            items_to_pop = (be_top(vm) - initial_top >= expected_items) ? expected_items : (be_top(vm) - initial_top);
+            ESP_LOGD(TAG, "ExecuteAndSend: Error %d, popping %d items (expected %d based on code)", ret_code, items_to_pop, expected_items);
 
-    // Send response
-    if (client_sockfd >= 0) {
-        ESP_LOGD(TAG, "Sending response to client %d (socket %d): '%s'", 
-                client_id, client_sockfd, response_buffer);
-        send_ws_text_frame(client_sockfd, response_buffer);
-    } else {
-         ESP_LOGE(TAG, "Invalid socket (%d) for client %d, can't send result", client_sockfd, client_id);
+        } else {
+            ESP_LOGW(TAG, "ExecuteAndSend: Stack top same as initial after error %d!", ret_code);
+            snprintf(response_buffer, sizeof(response_buffer), "%sError: Unknown error (%d)%s%s",
+                     newline, ret_code, newline, prompt);
+        }
     }
 
     // Pop result/error items from stack
     if (items_to_pop > 0) {
+        ESP_LOGD(TAG, "ExecuteAndSend: Popping %d items from stack", items_to_pop);
         be_pop(vm, items_to_pop);
     }
 
-    // Sanity check stack - Log error if mismatch, but don't try to fix it.
-    int expected_final_top = original_top - items_to_pop;
-    if (be_top(vm) != expected_final_top) { 
-         ESP_LOGE(TAG, "Stack imbalance after sending result for client %d! Top: %d, Expected: %d (Original Top: %d, Popped: %d)",
-                 client_id, be_top(vm), expected_final_top, original_top, items_to_pop);
+    // 5. Send response
+    if (client_sockfd >= 0) {
+        ESP_LOGD(TAG, "ExecuteAndSend: Sending response to client %d (socket %d): '%s'", 
+                client_id, client_sockfd, response_buffer);
+        send_ws_text_frame(client_sockfd, response_buffer);
+    } else {
+         ESP_LOGE(TAG, "ExecuteAndSend: Invalid socket (%d) for client %d, can't send response", client_sockfd, client_id);
+    }
+
+    // 6. Final stack check (optional)
+    if (be_top(vm) != initial_top) { 
+         ESP_LOGE(TAG, "ExecuteAndSend: Stack imbalance after sending! Top: %d, Expected: %d (Original: %d, Popped: %d)",
+                 client_id, be_top(vm), initial_top, initial_top, items_to_pop);
     }
 }
 
@@ -527,7 +506,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
         return;
     }
 
-    // === Character by Character Processing ===
+    // === Character by Character Processing eg for WebREPL client ===
     size_t command_start_index = 0; // Start index of pending chars in current `data` frame
 
     for (size_t i = 0; i < len; ++i) {
@@ -586,13 +565,10 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                  int original_stream_sockfd = g_stream_sockfd;
                  g_stream_sockfd = sockfd;
                  
-                 int exec_result = _be_webrepl_attempt_execute(vm, client->command_buffer, client->command_len);
+                 _be_webrepl_execute_and_send(vm, client_id, sockfd, client->command_buffer, client->command_len);
                  
                  // ===> Restore stream sockfd <===
                  g_stream_sockfd = original_stream_sockfd;
-
-                 ESP_LOGI(TAG, "Execution attempt result for client %d: %d", client_id, exec_result);
-                 _be_webrepl_send_result(vm, client_id, sockfd, exec_result); // Send result/error/prompt
 
                  // Clear buffer after execution attempt
                  client->command_len = 0;
@@ -640,7 +616,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
         // Append remaining data
         memcpy(client->command_buffer + client->command_len, &data[command_start_index], remaining_chars);
         client->command_len += remaining_chars;
-        client->command_buffer[client->command_len] = '\0'; // Null terminate
+        client->command_buffer[client->command_len] = '\0'; 
         ESP_LOGD(TAG, "Appended %d tail chars. Buffer len %d: '%s'", 
                  (int)remaining_chars, (int)client->command_len, client->command_buffer ? client->command_buffer : "<NULL>");
     }
