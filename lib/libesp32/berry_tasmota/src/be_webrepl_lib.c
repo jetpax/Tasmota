@@ -350,14 +350,23 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
 }
 
 
-
-// be_repl.c's is_multline function
+// cf be_repl.c's is_multline function
 static bbool is_multline(bvm *vm) {
     const char *msg = be_tostring(vm, -1);
-    size_t len = strlen(msg);
-    if (len > 5) {  // Multi-line text if the error message is 'EOS' at the end
-        return !strcmp(msg + len - 5, "'EOS'");
+    ESP_LOGD(TAG, "Error message: '%s'", msg);
+    
+    // All incomplete statements will have "unexpected 'EOF'" in the error message
+    // This is more robust than checking for specific constructs
+    if (strstr(msg, "unexpected 'EOF'") != NULL) {
+        return btrue;
     }
+    
+    // Original EOS check as a fallback
+    size_t len = strlen(msg);
+    if (len > 5 && !strcmp(msg + len - 5, "'EOS'")) {
+        return btrue;
+    }
+    
     return bfalse;
 }
 
@@ -371,102 +380,7 @@ static int try_return(bvm *vm, const char *line) {
     return res;
 }
 
-// cf be_repl.c's compile function
-static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
-    int res = try_return(vm, client->command_buffer);
-    
-    if (be_getexcept(vm, res) == BE_SYNTAX_ERROR) {
-        be_pop(vm, 2);  // Pop exception values
-        
-        // Push the current buffer as source
-        be_pushstring(vm, client->command_buffer);
-        
-        // If we're not already in multi-line mode, reset the buffer
-        if (!client->in_multiline) {
-            client->command_len = 0;
-            client->command_buffer[0] = '\0';
-        }
-        
-        for (;;) {
-            const char *src = be_tostring(vm, -1);  // Get source code
-            int idx = be_absindex(vm, -1);  // Get source text absolute index
-            
-            // Compile source line
-            res = be_loadbuffer(vm, "webrepl", src, strlen(src));
-            
-            if (!res || !is_multline(vm)) {
-                be_remove(vm, idx);  // Remove source code
-                
-                // If compilation succeeded or it's not a multi-line error, exit loop
-                if (!client->in_multiline) {
-                    // Send normal prompt for next input
-                    send_ws_text_frame(sockfd, ">>> ");
-                }
-                return res;
-            }
-            
-            // Multi-line case: need more input
-            be_pop(vm, 2);  // Pop exception values
-            
-            // Set multi-line flag if not already set
-            client->in_multiline = true;
-            
-            // Send continuation prompt
-            send_ws_text_frame(sockfd, "... ");
-            
-            // Unlike be_repl.c, we can't call getline() here to get more input.
-            // Instead, we need to save the current state and wait for more data.
-            // We'll append a newline for continuation when we return.
-            be_pushfstring(vm, "\n");
-            be_strconcat(vm, -2);  // Concatenate newline with source
-            be_pop(vm, 1);  // Pop newline
-            
-            // Note: For WebREPL, we're saving partial state and will continue
-            // when more data arrives in a future call to be_webrepl_handle_input.
-            // This is a fundamental difference from the synchronous REPL.
-            return BE_OK;  // Return success to indicate we're waiting for more input
-        }
-    }
-    
-    // Not a syntax error or multi-line case
-    if (res == BE_OK) {
-        // Send normal prompt for next input since compilation succeeded
-        send_ws_text_frame(sockfd, ">>> ");
-    }
-    
-    // Reset buffer if compilation succeeded or failed with non-syntax error
-    client->command_len = 0;
-    client->command_buffer[0] = '\0';
-    client->in_multiline = false;
-    
-    return res;
-}
-
-// cf be_repl.c's call_script function
-static int webrepl_call_script(bvm *vm, int sockfd) {
-    int res = be_pcall(vm, 0);  // Call the main function
-    
-    switch (res) {
-        case BE_OK:  // Execution succeeded
-            if (!be_isnil(vm, -1)) {  // Print return value when it's not nil
-                be_dumpvalue(vm, -1);
-            }
-            be_pop(vm, 1);  // Pop the result value
-            break;
-            
-        case BE_EXCEPTION:  // VM run error
-            be_dumpexcept(vm);
-            be_pop(vm, 1);  // Pop the function value
-            break;
-            
-        default:  // BE_EXIT or BE_MALLOC_FAIL
-            return res;
-    }
-    
-    return 0;
-}
-
-// Helper function for buffer management (WebREPL specific)
+// buffer management (WebREPL specific)
 static bool ensure_command_buffer(ws_client_t *client, size_t additional_len) {
     if (!client) return false;
     
@@ -496,6 +410,133 @@ static bool ensure_command_buffer(ws_client_t *client, size_t additional_len) {
     }
     
     return true;
+}
+
+// cf be_repl.c's compile function
+static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
+    // First try as an expression
+    int res = try_return(vm, client->command_buffer);
+    
+    // Handle syntax errors (may be multi-line statements)
+    if (be_getexcept(vm, res) == BE_SYNTAX_ERROR) {
+        be_pop(vm, 2);  // Pop exception values
+        
+        // Push the current buffer as source
+        be_pushstring(vm, client->command_buffer);
+        
+        // If not in multi-line mode, this is the first line
+        if (!client->in_multiline) {
+            // This might be the start of a multi-line statement
+            // Leave buffer contents intact, they'll be used if this is multi-line
+        } else {
+            // In multi-line mode already, the source code is on the stack
+            // and already contains all previous lines
+        }
+        
+        // Attempt to compile the current source
+        const char *src = be_tostring(vm, -1);  // Get source code
+        int idx = be_absindex(vm, -1);  // Get source text absolute index
+        res = be_loadbuffer(vm, "webrepl", src, strlen(src));
+        
+        // Check if compilation succeeded or it's a non-multi-line error
+        if (!res || !is_multline(vm)) {
+            be_remove(vm, idx);  // Remove source code
+            
+            // If there's an error and it's not multi-line, dump it
+            if (res) {
+                be_dumpexcept(vm);
+            }
+            
+            // Reset multi-line state - either completed successfully or has error
+            client->in_multiline = false;
+            
+            // Reset the command buffer
+            client->command_len = 0;
+            client->command_buffer[0] = '\0';
+            
+            // Send appropriate prompt
+            send_ws_text_frame(sockfd, ">>> ");
+            
+            return res;
+        }
+        
+        // This is a multi-line statement needing more input
+        be_pop(vm, 2);  // Pop exception values
+        
+        // Set multi-line flag
+        client->in_multiline = true;
+        
+        // Send continuation prompt
+        send_ws_text_frame(sockfd, "... ");
+        
+        // Remove the source code from stack - it's now in client->command_buffer
+        be_remove(vm, idx);
+        
+        // Return special OK value to indicate waiting for more input
+        return BE_OK;
+    }
+    
+    // Expression evaluation succeeded or non-syntax error occurred
+    if (res == BE_OK) {
+        // Reset buffer and multi-line state
+        client->command_len = 0;
+        client->command_buffer[0] = '\0';
+        client->in_multiline = false;
+        
+        // Send normal prompt
+        send_ws_text_frame(sockfd, ">>> ");
+    } else {
+        // Non-syntax error
+        be_dumpexcept(vm);
+        
+        // Reset buffer and multi-line state
+        client->command_len = 0;
+        client->command_buffer[0] = '\0';
+        client->in_multiline = false;
+        
+        // Send normal prompt
+        send_ws_text_frame(sockfd, ">>> ");
+    }
+    
+    return res;
+}
+
+// cf be_repl.c's call_script function
+static int webrepl_call_script(bvm *vm, int sockfd) {
+    int res = be_pcall(vm, 0);  // Call the main function
+    
+    // Get result value
+    if (res == BE_OK) {
+        // First check the actual result value which is on the stack for expressions
+        if (!be_isnil(vm, -1)) {
+            const char *result = be_tostring(vm, -1);
+            if (result && *result) {
+                send_ws_text_frame(sockfd, "  ");
+                send_ws_text_frame(sockfd, result);
+                send_ws_text_frame(sockfd, "\r\n");
+            }
+        }
+        
+        // Now check the global WS_OUTPUT which might contain printed output
+        be_getglobal(vm, "WS_OUTPUT");
+        if (!be_isnil(vm, -1)) {  // Only display if not nil
+            const char *output = be_tostring(vm, -1);
+            if (output && *output) {
+                send_ws_text_frame(sockfd, "  ");
+                send_ws_text_frame(sockfd, output);
+                send_ws_text_frame(sockfd, "\r\n");
+            }
+        }
+        be_pop(vm, 2);  // Pop result value and WS_OUTPUT
+    } else {
+        // Maybe a 'return' expression error
+        be_dumpexcept(vm);
+    }
+    
+    // Send prompt immediately after execution
+    send_ws_text_frame(sockfd, ">>> ");
+    
+    return 0;
 }
 
 // Handles all incoming data for a client in REPL mode
@@ -551,59 +592,76 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
         
         // Process this line if it's not empty
         size_t line_len = line_end - current;
-        if (line_len > 0 || (line_end < end)) {  // Non-empty line or empty line with terminator
-            // Ensure command buffer has enough space
-            if (!ensure_command_buffer(client, line_len + 2)) {  // +2 for newline and null terminator
+        
+        // Special handling for multi-line continuation
+        if (client->in_multiline) {
+            // For multi-line, we need to append the new line with a newline character
+            if (!ensure_command_buffer(client, client->command_len + line_len + 2)) {
                 ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
                 return;
             }
             
-            // Append line to buffer
+            // Append a newline first if we have existing content
+            if (client->command_len > 0) {
+                client->command_buffer[client->command_len++] = '\n';
+            }
+            
+            // Then append the new line
             if (line_len > 0) {
                 memcpy(client->command_buffer + client->command_len, current, line_len);
                 client->command_len += line_len;
-                client->command_buffer[client->command_len] = '\0';
             }
+            client->command_buffer[client->command_len] = '\0';
             
-            // If we have a line terminator, process the command
-            if (line_end < end && (*line_end == '\r' || *line_end == '\n')) {
+            // Echo newline
+            send_ws_text_frame(sockfd, "\r\n");
+        } else {
+            // Normal single-line processing
+            if (line_len > 0 || (line_end < end)) {  // Non-empty line or empty line with terminator
+                // Ensure command buffer has enough space
+                if (!ensure_command_buffer(client, line_len + 2)) {  // +2 for newline and null terminator
+                    ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
+                    return;
+                }
+                
+                // Append line to buffer
+                if (line_len > 0) {
+                    memcpy(client->command_buffer + client->command_len, current, line_len);
+                    client->command_len += line_len;
+                    client->command_buffer[client->command_len] = '\0';
+                }
+                
                 // Echo newline
                 send_ws_text_frame(sockfd, "\r\n");
-                
-                // Redirect output to WebSocket during execution
-                int original_stream_sockfd = g_stream_sockfd;
-                g_stream_sockfd = sockfd;
-                
-                // Exact pattern from be_repl.c: Compile then call script if successful
-                int res = webrepl_compile(vm, client, sockfd);
-                
-                if (res == BE_MALLOC_FAIL) {
-                    ESP_LOGE(TAG, "Memory allocation failure during compilation");
-                } else if (res) {
-                    // Compilation error
-                    be_dumpexcept(vm);
-                } else {
-                    // Compiled successfully, execute it
-                    res = webrepl_call_script(vm, sockfd);
-                    if (res) {
-                        ESP_LOGE(TAG, "Execution error: %d", res);
-                    }
+            }
+        }
+        
+        // If we have a line terminator, process the command
+        if (line_end < end && (*line_end == '\r' || *line_end == '\n')) {
+            // Redirect output to WebSocket during execution
+            int original_stream_sockfd = g_stream_sockfd;
+            g_stream_sockfd = sockfd;
+            
+            // Compile and execute
+            int res = webrepl_compile(vm, client, sockfd);
+            if (res == BE_OK && !client->in_multiline) {
+                // Only execute if compilation succeeded and we're not in multi-line mode
+                res = webrepl_call_script(vm, sockfd);
+                if (res) {
+                    ESP_LOGE(TAG, "Execution error: %d", res);
                 }
-                
-                // Restore original output stream
-                g_stream_sockfd = original_stream_sockfd;
-                
-                // Skip past line terminator(s)
-                current = line_end + 1;
-                if (current < end && *line_end == '\r' && *current == '\n') {
-                    current++;  // Skip LF in CRLF sequence
-                }
-            } else {
-                // No line terminator, means we've processed all data
-                current = line_end;
+            }
+            
+            // Restore original output stream
+            g_stream_sockfd = original_stream_sockfd;
+            
+            // Skip past line terminator(s)
+            current = line_end + 1;
+            if (current < end && *line_end == '\r' && *current == '\n') {
+                current++;  // Skip LF in CRLF sequence
             }
         } else {
-            // Skip empty content with no terminator
+            // No line terminator, means we've processed all data
             current = line_end;
         }
     }
