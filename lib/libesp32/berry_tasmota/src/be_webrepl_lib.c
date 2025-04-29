@@ -473,6 +473,7 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
         // Attempt to compile the current source
         const char *src = be_tostring(vm, -1);  // Get source code
         int idx = be_absindex(vm, -1);  // Get source text absolute index
+        /* compile source line */
         res = be_loadbuffer(vm, "webrepl", src, strlen(src));
         // Check if compilation succeeded or it's a non-multi-line error
         if (!res || !is_multline(vm)) {
@@ -480,6 +481,7 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
             // If there's an error and it's not multi-line, dump it
             if (res) {
                 be_dumpexcept(vm);
+                send_ws_text_frame(sockfd, "\r\n" WEBREPL_PROMPT);
             }
             // Reset multi-line state - either completed successfully or has error
             client->in_multiline = false;
