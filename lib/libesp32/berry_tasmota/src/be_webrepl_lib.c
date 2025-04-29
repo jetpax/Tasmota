@@ -21,7 +21,7 @@
 #ifdef USE_BERRY_WEBREPL
 
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
 #endif
 
 
@@ -30,7 +30,6 @@
 // ESP-IDF / FreeRTOS includes 
 #include "esp_log.h"
 #include "esp_err.h" 
-// #include "esp_http_server.h" // Provided by be_webrepl.h
 #include "freertos/FreeRTOS.h" 
 
 // Berry includes
@@ -38,17 +37,36 @@
 #include "be_exec.h"
 
 
-#include "be_webrepl.h" // <<< Include the new header
+#include "be_webrepl.h" 
 
+#include "include/tasmota_version.h"        // Tasmota version information
 
 
 #define TAG "WEBREPL"
 
 
 // --- WebREPL Specific Constants ---
+#define WEBREPL_PROMPT "> "
+#define WEBREPL_CONTINUATION_PROMPT "... "
 #define WEBREPL_PASSWORD_PROMPT "Password: "
 static const char* webrepl_password = "password"; // CHANGE THIS!
 
+// --- Initialize WebREPL-specific client data ---
+void webrepl_init_client(int client_slot) {
+    if (client_slot < 0 || client_slot >= MAX_WS_CLIENTS) {
+        ESP_LOGE(TAG, "Invalid client slot %d in webrepl_init_client", client_slot);
+        return;
+    }
+    
+    ws_clients[client_slot].command_buffer = NULL;    // Initialized to NULL
+    ws_clients[client_slot].command_len = 0;          // Initialized to 0
+    ws_clients[client_slot].buffer_capacity = 0;      // Initialized to 0
+    ws_clients[client_slot].line_buffer = NULL;       // Initialize line buffer for char-by-char input
+    ws_clients[client_slot].line_len = 0;             // Initialize line length
+    ws_clients[client_slot].line_capacity = 0;        // Initialize line buffer capacity
+    memset(&ws_clients[client_slot].binop, 0, sizeof(ws_clients[client_slot].binop)); // Initialize binary op state
+    ESP_LOGD(TAG, "Initialized WebREPL-specific data for client %d", client_slot);
+}
 
 // --- WebREPL Helper Functions ---
 
@@ -327,8 +345,8 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
     }
 
      // --- 5. Handle GET Confirmation (Not standard WebREPL, but maybe useful) ---
-     // MicroPython's client might send a single byte (often 0x00) after receiving
-     // a data chunk to signal readiness for the next one. Our current send logic
+     // webREPL client might send a single byte (often 0x00) after receiving
+     // a data chunk to signal readiness for the next one. current send logic
      // doesn't wait for this, it just sends chunks. If we needed to wait:
      /*
      if (op_state->active && op_state->hdr.op == WEBREPL_OP_GET_FILE && op_state->fp != NULL) {
@@ -451,43 +469,23 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
     // Handle syntax errors (may be multi-line statements)
     if (be_getexcept(vm, res) == BE_SYNTAX_ERROR) {
         be_pop(vm, 2);  // Pop exception values
-        
-        // Push the current buffer as source
         be_pushstring(vm, client->command_buffer);
-        
-        // If not in multi-line mode, this is the first line
-        if (!client->in_multiline) {
-            // This might be the start of a multi-line statement
-            // Leave buffer contents intact, they'll be used if this is multi-line
-        } else {
-            // In multi-line mode already, the source code is on the stack
-            // and already contains all previous lines
-        }
-        
         // Attempt to compile the current source
         const char *src = be_tostring(vm, -1);  // Get source code
         int idx = be_absindex(vm, -1);  // Get source text absolute index
         res = be_loadbuffer(vm, "webrepl", src, strlen(src));
-        
         // Check if compilation succeeded or it's a non-multi-line error
         if (!res || !is_multline(vm)) {
             be_remove(vm, idx);  // Remove source code
-            
             // If there's an error and it's not multi-line, dump it
             if (res) {
                 be_dumpexcept(vm);
             }
-            
             // Reset multi-line state - either completed successfully or has error
             client->in_multiline = false;
-            
             // Reset the command buffer
             client->command_len = 0;
-            client->command_buffer[0] = '\0';
-            
-            // Send appropriate prompt
-            send_ws_text_frame(sockfd, ">>> ");
-            
+            client->command_buffer[0] = '\0';          
             return res;
         }
         
@@ -498,7 +496,7 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
         client->in_multiline = true;
         
         // Send continuation prompt
-        send_ws_text_frame(sockfd, "... ");
+        send_ws_text_frame(sockfd, WEBREPL_CONTINUATION_PROMPT);
         
         // Remove the source code from stack - it's now in client->command_buffer
         be_remove(vm, idx);
@@ -514,8 +512,6 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
         client->command_buffer[0] = '\0';
         client->in_multiline = false;
         
-        // Send normal prompt
-        send_ws_text_frame(sockfd, ">>> ");
     } else {
         // Non-syntax error
         be_dumpexcept(vm);
@@ -526,7 +522,7 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
         client->in_multiline = false;
         
         // Send normal prompt
-        send_ws_text_frame(sockfd, ">>> ");
+        send_ws_text_frame(sockfd, WEBREPL_PROMPT);
     }
     
     return res;
@@ -534,39 +530,38 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
 
 // cf be_repl.c's call_script function
 static int webrepl_call_script(bvm *vm, int sockfd) {
+
     int res = be_pcall(vm, 0);  // Call the main function
-    
-    // Get result value
-    if (res == BE_OK) {
-        // First check the actual result value which is on the stack for expressions
-        if (!be_isnil(vm, -1)) {
-            const char *result = be_tostring(vm, -1);
-            if (result && *result) {
-                send_ws_text_frame(sockfd, "  ");
-                send_ws_text_frame(sockfd, result);
-                send_ws_text_frame(sockfd, "\r\n");
-            }
-        }
-        
-        // Now check the global WS_OUTPUT which might contain printed output
-        be_getglobal(vm, "WS_OUTPUT");
-        if (!be_isnil(vm, -1)) {  // Only display if not nil
-            const char *output = be_tostring(vm, -1);
-            if (output && *output) {
-                send_ws_text_frame(sockfd, "  ");
-                send_ws_text_frame(sockfd, output);
-                send_ws_text_frame(sockfd, "\r\n");
-            }
-        }
-        be_pop(vm, 2);  // Pop result value and WS_OUTPUT
-    } else {
-        // Maybe a 'return' expression error
-        be_dumpexcept(vm);
+
+    // if function printed anything, need to add a newline
+    if (g_streamed){
+        g_streamed = false;
+        send_ws_text_frame(sockfd, "\r\n");
     }
-    
+
+    switch (res) {
+        case BE_OK: /* execution succeed */
+            // First check the actual result value which is on the stack for expressions
+            if (!be_isnil(vm, -1)) { // if output from command, eg 3+4
+                const char *result = be_tostring(vm, -1);
+                if (result && *result) {
+                    // send_ws_text_frame(sockfd, "  ");
+                    send_ws_text_frame(sockfd, result);
+                    send_ws_text_frame(sockfd, "\r\n");
+                }
+            } 
+            be_pop(vm, 1);  // Pop result value
+            break;
+        case BE_EXCEPTION: /* vm run error */
+            // Maybe a 'return' expression error
+            be_dumpexcept(vm);
+            be_pop(vm, 1); /* pop the function value */
+            break;
+        default: /* BE_EXIT or BE_MALLOC_FAIL */
+            return res;
+    }   
     // Send prompt immediately after execution
-    send_ws_text_frame(sockfd, "\n\r>>> ");
-    
+    send_ws_text_frame(sockfd, WEBREPL_PROMPT);
     return 0;
 }
 
@@ -576,11 +571,9 @@ static int compile_and_execute_command(bvm *vm, ws_client_t *client, int sockfd)
         ESP_LOGE(TAG, "Invalid parameters in compile_and_execute_command");
         return -1;
     }
-    
-    // Redirect output to WebSocket during execution
-    int original_stream_sockfd = g_stream_sockfd;
-    g_stream_sockfd = sockfd;
-    
+    g_stream_sockfd = sockfd;   // enable print streaming to ws
+    g_streamed = false;
+
     // Compile the command - this will update client->in_multiline as needed
     int res = webrepl_compile(vm, client, sockfd);
     
@@ -591,8 +584,8 @@ static int compile_and_execute_command(bvm *vm, ws_client_t *client, int sockfd)
             ESP_LOGE(TAG, "Execution error: %d", res);
         }
     }
-    g_stream_sockfd = original_stream_sockfd;
-    
+    g_stream_sockfd = -1;
+
     return res;
 }
 
@@ -637,7 +630,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
         }
         
         // Send prompt
-        send_ws_text_frame(sockfd, "\r\n>>> ");
+        send_ws_text_frame(sockfd, "\r\n" WEBREPL_PROMPT);
         return;
     }
     
@@ -711,9 +704,9 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
             } else {
                 // Empty line, just show prompt if not in multi-line mode
                 if (!client->in_multiline) {
-                    send_ws_text_frame(sockfd, ">>> ");
+                    send_ws_text_frame(sockfd, WEBREPL_PROMPT);
                 } else {
-                    send_ws_text_frame(sockfd, "... ");
+                    send_ws_text_frame(sockfd, WEBREPL_CONTINUATION_PROMPT);
                 }
             }
             

@@ -70,6 +70,7 @@ typedef struct {
 extern ws_client_t ws_clients[MAX_WS_CLIENTS];
 extern httpd_handle_t ws_server;
 extern volatile int g_stream_sockfd;
+extern volatile bool g_streamed;
 
 // Prototypes for functions defined in be_wsserver_lib.c
 extern bool is_client_valid(int client_id);
@@ -77,5 +78,9 @@ extern void handle_client_disconnect(int client_slot);
 extern void send_ws_text_frame(int sockfd, const char* text);
 extern void send_ws_text_frame_to_client(int client_id, const char* text);
 
+// Prototypes for functions defined in be_webrepl_lib.c
+extern void webrepl_init_client(int client_slot);
+extern void be_webrepl_handle_input(bvm *vm, int client_id, const char* code, size_t len);
+extern void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_t len);
 
 #endif // BE_WEBREPL_H_ 

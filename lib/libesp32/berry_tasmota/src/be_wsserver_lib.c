@@ -20,7 +20,7 @@
 #ifdef USE_BERRY_WSSERVER
 
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
 #endif
 
 
@@ -133,7 +133,8 @@ static void start_ping_timer(void);
 
 // Globals
 httpd_handle_t ws_server = NULL; // Define the actual storage
-volatile int g_stream_sockfd = -1; // <<< FIXED: Add volatile to match declaration
+volatile int g_stream_sockfd = -1; // >=0, enables Berry print streaming to webREPL
+volatile bool g_streamed = false; // set when Berry streams, cleared when streaming disabled
 
 static bool wsserver_running = false;
 static uint32_t ping_interval_s;  // Ping interval in seconds
@@ -166,7 +167,7 @@ void send_ws_text_frame(int sockfd, const char* text) {
     }
     
     // Log to help debug message routing
-    ESP_LOGI(TAG, "Sending frame to socket %d: '%s'", sockfd, text);
+    ESP_LOGD(TAG, "Sending frame to socket %d: '%s'", sockfd, text);
     
     httpd_ws_frame_t frame;
     memset(&frame, 0, sizeof(frame));
@@ -175,12 +176,9 @@ void send_ws_text_frame(int sockfd, const char* text) {
     frame.type = HTTPD_WS_TYPE_TEXT;
     esp_err_t ret = httpd_ws_send_frame_async(ws_server, sockfd, &frame);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to send direct frame to sockfd %d: %s (%d)", 
+        ESP_LOGE(TAG, "Failed to send frame to sockfd %d: %s (%d)", 
                  sockfd, esp_err_to_name(ret), ret);
-    } else {
-        ESP_LOGI(TAG, "Successfully sent frame to socket %d", sockfd);
-    }
-}
+    } }
 
 // Check if a client is valid and connected - REMOVED (declared extern in be_webrepl.h)
 // bool is_client_valid(int client_id) { ... }
@@ -363,7 +361,7 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
         int sockfd = ws_clients[client_id].sockfd;
         bool is_binary_op = (user_data != NULL); // Use user_data now!
 
-        ESP_LOGI(TAG, "Handling WebSocket message event in main task: client=%d, state=%d, len=%d, is_binary=%d", 
+        ESP_LOGD(TAG, "Handling WebSocket message event in main task: client=%d, state=%d, len=%d, is_binary=%d", 
                 client_id, state, (int)len, is_binary_op);
 
         if (state == WS_STATE_REPL && is_binary_op) {
@@ -664,13 +662,22 @@ static int add_client(int sockfd) {
         ws_clients[slot].active = true;
         ws_clients[slot].last_activity = esp_timer_get_time() / 1000; // Use ms
         ws_clients[slot].state = WS_STATE_INIT; // Start in INIT state
-        ws_clients[slot].command_buffer = NULL;      // Initialized to NULL
-        ws_clients[slot].command_len = 0;          // Initialized to 0
-        ws_clients[slot].buffer_capacity = 0;      // Initialized to 0
-        ws_clients[slot].line_buffer = NULL;       // Initialize line buffer for char-by-char input
-        ws_clients[slot].line_len = 0;             // Initialize line length
-        ws_clients[slot].line_capacity = 0;        // Initialize line buffer capacity
-        memset(&ws_clients[slot].binop, 0, sizeof(ws_clients[slot].binop)); // Initialize binary op state
+        
+#ifdef USE_BERRY_WEBREPL
+        // Initialize WebREPL-specific client data
+        webrepl_init_client(slot);
+// #else
+//         // When WebREPL is not enabled, we still need to initialize the struct to zeros
+//         // but we don't need the dynamic buffers
+//         ws_clients[slot].command_buffer = NULL;
+//         ws_clients[slot].command_len = 0;
+//         ws_clients[slot].buffer_capacity = 0;
+//         ws_clients[slot].line_buffer = NULL;
+//         ws_clients[slot].line_len = 0;
+//         ws_clients[slot].line_capacity = 0;
+//         memset(&ws_clients[slot].binop, 0, sizeof(ws_clients[slot].binop));
+#endif
+
         ESP_LOGI(TAG, "Added client %d (socket %d), state INIT.", slot, sockfd);
         return slot;
     }
