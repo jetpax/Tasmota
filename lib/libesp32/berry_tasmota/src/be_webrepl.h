@@ -58,6 +58,9 @@ typedef struct {
     size_t command_len;         // Current length in buffer
     size_t buffer_capacity;     // Allocated capacity
     bool in_multiline;          // Flag indicating multi-line code block being processed
+    char *line_buffer;          // Buffer for handling character-by-character input
+    size_t line_len;            // Current length of line buffer
+    size_t line_capacity;       // Total capacity of line buffer
     webrepl_binop_state_t binop;
 } ws_client_t;
 

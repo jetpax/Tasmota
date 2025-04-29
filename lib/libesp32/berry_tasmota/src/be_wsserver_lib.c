@@ -79,6 +79,9 @@ typedef struct {
     char *command_buffer;       // Dynamic buffer
     size_t command_len;         // Current length in buffer
     size_t buffer_capacity;     // Allocated capacity
+    char *line_buffer;          // Dynamic buffer for line-by-line input
+    size_t line_len;            // Current length in line buffer
+    size_t line_capacity;       // Allocated capacity for line buffer
     webrepl_binop_state_t binop;
 } ws_client_t;
 
@@ -587,6 +590,13 @@ void handle_client_disconnect(int client_slot) {
         ws_clients[client_slot].command_len = 0;
         ws_clients[client_slot].buffer_capacity = 0;
     }
+    if (ws_clients[client_slot].line_buffer) {
+        ESP_LOGD(TAG, "Disconnect Handler: Freeing line buffer for client %d", client_slot);
+        free(ws_clients[client_slot].line_buffer);
+        ws_clients[client_slot].line_buffer = NULL;
+        ws_clients[client_slot].line_len = 0;
+        ws_clients[client_slot].line_capacity = 0;
+    }
 }
 
 // Timer callback for pinging clients
@@ -657,6 +667,9 @@ static int add_client(int sockfd) {
         ws_clients[slot].command_buffer = NULL;      // Initialized to NULL
         ws_clients[slot].command_len = 0;          // Initialized to 0
         ws_clients[slot].buffer_capacity = 0;      // Initialized to 0
+        ws_clients[slot].line_buffer = NULL;       // Initialize line buffer for char-by-char input
+        ws_clients[slot].line_len = 0;             // Initialize line length
+        ws_clients[slot].line_capacity = 0;        // Initialize line buffer capacity
         memset(&ws_clients[slot].binop, 0, sizeof(ws_clients[slot].binop)); // Initialize binary op state
         ESP_LOGI(TAG, "Added client %d (socket %d), state INIT.", slot, sockfd);
         return slot;

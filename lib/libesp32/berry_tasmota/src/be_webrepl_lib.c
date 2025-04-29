@@ -412,6 +412,37 @@ static bool ensure_command_buffer(ws_client_t *client, size_t additional_len) {
     return true;
 }
 
+// Initialize client line buffer for character-by-character input
+static bool ensure_line_buffer(ws_client_t *client, size_t additional_len) {
+    if (!client) return false;
+    
+    // Calculate required capacity
+    size_t required_capacity = client->line_len + additional_len;
+    
+    // Check if we need to allocate or resize
+    if (!client->line_buffer) {
+        // First allocation, provide reasonable starting size
+        size_t initial_capacity = required_capacity > 128 ? required_capacity : 128;
+        client->line_buffer = malloc(initial_capacity);
+        if (!client->line_buffer) return false;
+        client->line_capacity = initial_capacity;
+        client->line_len = 0;
+        client->line_buffer[0] = '\0';
+    } else if (client->line_capacity < required_capacity) {
+        // Need to resize
+        size_t new_capacity = client->line_capacity * 2;
+        while (new_capacity < required_capacity) new_capacity *= 2;
+        
+        char *new_buffer = realloc(client->line_buffer, new_capacity);
+        if (!new_buffer) return false;
+        
+        client->line_buffer = new_buffer;
+        client->line_capacity = new_capacity;
+    }
+    
+    return true;
+}
+
 // cf be_repl.c's compile function
 static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
     // First try as an expression
@@ -534,9 +565,35 @@ static int webrepl_call_script(bvm *vm, int sockfd) {
     }
     
     // Send prompt immediately after execution
-    send_ws_text_frame(sockfd, ">>> ");
+    send_ws_text_frame(sockfd, "\n\r>>> ");
     
     return 0;
+}
+
+// Helper function to compile and execute a Berry command
+static int compile_and_execute_command(bvm *vm, ws_client_t *client, int sockfd) {
+    if (!vm || !client || sockfd < 0) {
+        ESP_LOGE(TAG, "Invalid parameters in compile_and_execute_command");
+        return -1;
+    }
+    
+    // Redirect output to WebSocket during execution
+    int original_stream_sockfd = g_stream_sockfd;
+    g_stream_sockfd = sockfd;
+    
+    // Compile the command - this will update client->in_multiline as needed
+    int res = webrepl_compile(vm, client, sockfd);
+    
+    // Only execute if compilation succeeded and not in multi-line mode
+    if (res == BE_OK && !client->in_multiline) {
+        res = webrepl_call_script(vm, sockfd);
+        if (res) {
+            ESP_LOGE(TAG, "Execution error: %d", res);
+        }
+    }
+    g_stream_sockfd = original_stream_sockfd;
+    
+    return res;
 }
 
 // Handles all incoming data for a client in REPL mode
@@ -560,25 +617,121 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
     ESP_LOGD(TAG, "REPL Input Handler: Client %d, Socket %d, Data len = %d", 
              client_id, sockfd, (int)len);
 
+    ws_client_t *client = &ws_clients[client_id];
+    
     // --- Handle special control characters ---
     if (len == 1 && data[0] == 0x03) { // Ctrl+C
         ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
         
         // Reset the client's command buffer if it exists
-        ws_client_t *client = &ws_clients[client_id];
         if (client->command_buffer) {
             client->command_len = 0;
             client->command_buffer[0] = '\0';
             client->in_multiline = false;
         }
         
+        // Reset line buffer too
+        if (client->line_buffer) {
+            client->line_len = 0;
+            client->line_buffer[0] = '\0';
+        }
+        
         // Send prompt
         send_ws_text_frame(sockfd, "\r\n>>> ");
         return;
     }
-
-    // Process input TEXT frame from ws line by line
-    ws_client_t *client = &ws_clients[client_id];
+    
+    // --- Handle character-by-character input ---
+    // If we received a single character (typical of interactive WebREPL clients)
+    if (len == 1) {
+        // Ensure we have a line buffer
+        if (!ensure_line_buffer(client, 2)) {  // +2 for the char and null terminator
+            ESP_LOGE(TAG, "Failed to allocate line buffer for client %d", client_id);
+            return;
+        }
+        
+        char c = data[0];
+        
+        // Handle backspace/delete
+        if (c == 0x08 || c == 0x7F) {
+            if (client->line_len > 0) {
+                client->line_len--;
+                client->line_buffer[client->line_len] = '\0';
+                // Echo backspace sequence to erase the last character
+                send_ws_text_frame(sockfd, "\b \b");
+            }
+            return;
+        }
+        
+        // Handle line termination (CR or LF)
+        if (c == '\r' || c == '\n') {
+            // Echo newline
+            send_ws_text_frame(sockfd, "\r\n");
+            
+            // Process the line if we have accumulated content or if we're in multi-line mode
+            if (client->line_len > 0 || client->in_multiline) {
+                // Special handling for multi-line input
+                if (client->in_multiline) {
+                    // For multi-line, we need to append the new line with a newline character
+                    if (!ensure_command_buffer(client, client->command_len + client->line_len + 2)) {
+                        ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
+                        return;
+                    }
+                    
+                    // Append a newline first if we have existing content in command buffer
+                    if (client->command_len > 0) {
+                        client->command_buffer[client->command_len++] = '\n';
+                    }
+                    
+                    // Then append the accumulated line
+                    if (client->line_len > 0) {
+                        memcpy(client->command_buffer + client->command_len, client->line_buffer, client->line_len);
+                        client->command_len += client->line_len;
+                    }
+                    client->command_buffer[client->command_len] = '\0';
+                } else {
+                    // Normal single-line processing
+                    // Copy line buffer to command buffer
+                    if (!ensure_command_buffer(client, client->line_len + 1)) {
+                        ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
+                        return;
+                    }
+                    
+                    memcpy(client->command_buffer, client->line_buffer, client->line_len);
+                    client->command_len = client->line_len;
+                    client->command_buffer[client->command_len] = '\0';
+                }
+                
+                // Reset line buffer for next line
+                client->line_len = 0;
+                client->line_buffer[0] = '\0';
+                
+                // Use the common helper function to compile and execute
+                compile_and_execute_command(vm, client, sockfd);
+            } else {
+                // Empty line, just show prompt if not in multi-line mode
+                if (!client->in_multiline) {
+                    send_ws_text_frame(sockfd, ">>> ");
+                } else {
+                    send_ws_text_frame(sockfd, "... ");
+                }
+            }
+            
+            return;
+        }
+        
+        // Regular character, append to line buffer and echo
+        client->line_buffer[client->line_len++] = c;
+        client->line_buffer[client->line_len] = '\0';
+        
+        // Echo the character back
+        char echo[2] = {c, '\0'};
+        send_ws_text_frame(sockfd, echo);
+        
+        return;
+    }
+    
+    // --- Handle normal line-by-line input (not character-by-character) ---
     const char *current = data;
     const char *end = data + len;
     int initial_top = be_top(vm);
@@ -638,22 +791,8 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
         
         // If we have a line terminator, process the command
         if (line_end < end && (*line_end == '\r' || *line_end == '\n')) {
-            // Redirect output to WebSocket during execution
-            int original_stream_sockfd = g_stream_sockfd;
-            g_stream_sockfd = sockfd;
-            
-            // Compile and execute
-            int res = webrepl_compile(vm, client, sockfd);
-            if (res == BE_OK && !client->in_multiline) {
-                // Only execute if compilation succeeded and we're not in multi-line mode
-                res = webrepl_call_script(vm, sockfd);
-                if (res) {
-                    ESP_LOGE(TAG, "Execution error: %d", res);
-                }
-            }
-            
-            // Restore original output stream
-            g_stream_sockfd = original_stream_sockfd;
+            // Use the common helper function to compile and execute
+            compile_and_execute_command(vm, client, sockfd);
             
             // Skip past line terminator(s)
             current = line_end + 1;
