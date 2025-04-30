@@ -430,6 +430,7 @@ void setup(void) {
 #endif  // CONFIG_IDF_TARGET_ESP32
 #endif  // ESP32
 
+
 #ifdef USE_ESP32_WDT
   enableLoopWDT();          // enabled WDT Watchdog on Arduino `loop()` - must return before 5s or called `feedLoopWDT();` - included in `yield()`
 #endif // USE_ESP32_WDT
@@ -486,6 +487,7 @@ void setup(void) {
     TasmotaGlobal.log_buffer[0] = '\0';
   }
 #endif  // PIO_FRAMEWORK_ARDUINO_MMU_CACHE16_IRAM48_SECHEAP_SHARED
+
   if (Settings == nullptr) {
     Settings = (TSettings*)calloc(1, sizeof(TSettings));
   }
@@ -549,6 +551,10 @@ void setup(void) {
 #endif  // ESP32
 
   // Ready for AddLog use
+
+  AddLog(LOG_LEVEL_INFO, PSTR("MAIN: Enabling ESP_LOGx"));
+  esp_log_level_set("*", ESP_LOG_DEBUG);
+  ESP_LOGI("MAIN", "Entering Setup");
 
 //  AddLog(LOG_LEVEL_INFO, PSTR("ADR: Settings %p, Log %p"), Settings, TasmotaGlobal.log_buffer);
 #ifdef ESP32

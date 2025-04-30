@@ -31,7 +31,9 @@ extern "C" void __yield(void);              // original function from Arduino Co
 extern "C"
 void yield(void) {
   __yield();
-  feedLoopWDT();
+  #ifdef USE_ESP32_WDT
+    feedLoopWDT();
+  #endif  // USE_ESP32_WDT  
 }
 
 // patching delay(uint32_t ms)
