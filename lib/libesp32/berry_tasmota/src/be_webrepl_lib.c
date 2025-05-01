@@ -56,13 +56,29 @@ void webrepl_init_client(int client_slot) {
         return;
     }
     
-    ws_clients[client_slot].command_buffer = NULL;    // Initialized to NULL
-    ws_clients[client_slot].command_len = 0;          // Initialized to 0
-    ws_clients[client_slot].buffer_capacity = 0;      // Initialized to 0
-    ws_clients[client_slot].line_buffer = NULL;       // Initialize line buffer for char-by-char input
-    ws_clients[client_slot].line_len = 0;             // Initialize line length
-    ws_clients[client_slot].line_capacity = 0;        // Initialize line buffer capacity
-    memset(&ws_clients[client_slot].binop, 0, sizeof(ws_clients[client_slot].binop)); // Initialize binary op state
+    ESP_LOGD(TAG, "Initializing/Resetting WebREPL-specific data for client slot %d", client_slot);
+
+    // --- Explicitly free existing buffers FIRST ---
+    if (ws_clients[client_slot].command_buffer) {
+        ESP_LOGW(TAG, "webrepl_init_client: Freeing existing command_buffer for slot %d", client_slot);
+        free(ws_clients[client_slot].command_buffer);
+    }
+    if (ws_clients[client_slot].line_buffer) {
+         ESP_LOGW(TAG, "webrepl_init_client: Freeing existing line_buffer for slot %d", client_slot);
+        free(ws_clients[client_slot].line_buffer);
+    }
+    // --- End Free ---
+
+    // Initialize/Reset all WebREPL fields
+    ws_clients[client_slot].command_buffer = NULL;
+    ws_clients[client_slot].command_len = 0;         
+    ws_clients[client_slot].buffer_capacity = 0;      
+    ws_clients[client_slot].line_buffer = NULL;       
+    ws_clients[client_slot].line_len = 0;             
+    ws_clients[client_slot].line_capacity = 0;        
+    memset(&ws_clients[client_slot].binop, 0, sizeof(ws_clients[client_slot].binop));
+    ws_clients[client_slot].in_multiline = false;
+    // NOTE: repl_state is initialized in add_client
     ESP_LOGD(TAG, "Initialized WebREPL-specific data for client %d", client_slot);
 }
 

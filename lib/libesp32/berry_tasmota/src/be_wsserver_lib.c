@@ -285,13 +285,6 @@ void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t
                 }
                 ws_clients[client_id].binop.active = false;
             }
-            
-            ws_clients[client_id].sockfd = -1;
-            ws_clients[client_id].repl_state = 0; // Reset state
-            if (ws_clients[client_id].command_buffer) {
-                ws_clients[client_id].command_len = 0;
-                ws_clients[client_id].command_buffer[0] = '\0';
-            }
         }
     } else {
         // Normal message event with data
@@ -438,7 +431,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         if ((ws_pkt.len == 1) && (text_payload[0]  < 0x20 || text_payload[0]  == 0x7F)) {
             ESP_LOGD(TAG, "Client %d (State:%d) Received CTRL char '[0x%02X]'", client_slot, ws_clients[client_slot].repl_state, text_payload[0] );
         } else {
-            ESP_LOGD(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].repl_state, ws_pkt.len, text_payload ? text_payload : "");
+            ESP_LOGI(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].repl_state, ws_pkt.len, text_payload ? text_payload : "");
         }                
         // Queue the message - httpserver_queue_message will make its own copy
         if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, text_payload, ws_pkt.len, NULL)) {
@@ -487,15 +480,23 @@ void handle_client_disconnect(int client_slot) {
     
     // Mark client as inactive BEFORE queuing the event
     ws_clients[client_slot].active = false;
+    ws_clients[client_slot].sockfd = -1;             // Ensure sockfd is invalid
+    ws_clients[client_slot].repl_state = REPL_OFF; // Ensure state is reset
 
-    // Queue the disconnect event for VM context processing
+    #ifdef USE_BERRY_WEBREPL
+    // Ensure WebREPL state is cleared immediately too
+    webrepl_init_client(client_slot);
+    #endif
+
+    // Queue the disconnect event for VM context processing (mainly for callback)
     // The VM context handler will reset state and call callbacks
     if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, NULL, 0, NULL)) {
         ESP_LOGE(TAG, "WS Q disconnect failed!");
         // Ensure cleanup happens if queuing fails
-        ws_clients[client_slot].sockfd = -1;
-        ws_clients[client_slot].repl_state = 0;
-        if (ws_clients[client_slot].command_buffer) {
+        // Note: sockfd and repl_state already reset above.
+        //       webrepl_init_client already called above.
+        // The buffer clearing below might be redundant now, but safe if buffer exists.
+        if (ws_clients[client_slot].command_buffer) { // Check exists before accessing
             ws_clients[client_slot].command_len = 0;
             ws_clients[client_slot].command_buffer[0] = '\0';
         }
@@ -595,14 +596,16 @@ static int add_client(int sockfd) {
         ws_clients[slot].sockfd = sockfd;
         ws_clients[slot].active = true;
         ws_clients[slot].last_activity = esp_timer_get_time() / 1000; // Use ms
-        ws_clients[slot].repl_state = 0; // Start in OFF state
+        ws_clients[slot].repl_state = REPL_OFF; // Explicitly set initial state
         
+        ESP_LOGI(TAG, "Added client %d (socket %d), state OFF.", slot, sockfd);
+
+        // Initialize/Reset WebREPL specific parts (will free old buffers if any)
 #ifdef USE_BERRY_WEBREPL
         // Initialize WebREPL-specific client data
         webrepl_init_client(slot);
 #endif
 
-        ESP_LOGI(TAG, "Added client %d (socket %d), state OFF.", slot, sockfd);
         return slot;
     }
     ESP_LOGE(TAG, "No free client slots available");
