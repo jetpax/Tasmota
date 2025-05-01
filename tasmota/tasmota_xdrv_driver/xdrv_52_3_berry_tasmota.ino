@@ -25,19 +25,15 @@
 
 #ifdef USE_BERRY_WEBREPL // Check if the feature is enabled
 
-// === Add includes needed ONLY for streaming ===
 #include "esp_http_server.h" // For httpd_handle_t, httpd_ws_frame_t, etc.
 
-// === Declare external variables used for streaming ===
-// Use extern "C" if variables are defined in a .c file and this is compiled as .cpp
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Tell the compiler these exist elsewhere (e.g., in be_wsserver_lib.c)
 extern httpd_handle_t ws_server; // Handle for the server managing the WS connection
-extern volatile int g_stream_sockfd; // Target socket for streaming (-1 if none)
-                                     // Added volatile as it might be changed asynchronously
+extern volatile int g_stream_sockfd; // >=0, enables Berry print streaming to webREPL
+extern volatile bool g_streamed; // set when Berry streams, cleared when streaming disabled
 
 #ifdef __cplusplus
 }
@@ -1091,6 +1087,7 @@ void berry_log(const char * berry_buf) {
     // if the webrepl is active, redirect print output to the active websocket client
     int current_sockfd = g_stream_sockfd; // -1 means no stream
     httpd_handle_t current_server = ws_server;  
+
     if (current_sockfd >= 0 && current_server && berry_buf) {
 
       size_t buf_len = strlen(berry_buf);
@@ -1107,22 +1104,20 @@ void berry_log(const char * berry_buf) {
           send_buffer[2 + buf_len] = '\r';
           // Null terminate
           send_buffer[message_len] = '\0'; 
-
           httpd_ws_frame_t ws_pkt;
           memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
           ws_pkt.payload = (uint8_t*)send_buffer;
           ws_pkt.len = message_len; // Use the full message length including CRLFs
           ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-
           esp_err_t ret = httpd_ws_send_frame_async(current_server, current_sockfd, &ws_pkt);
-
           if (ret != ESP_OK) {
-              ESP_LOGE("berry_log_stream", "httpd_ws_send_frame_async failed for %d: %s", current_sockfd, esp_err_to_name(ret));
+            AddLog(LOG_LEVEL_ERROR, "WRPL: httpd_ws_send_frame_async failed for %d: %s", current_sockfd, esp_err_to_name(ret) );
           } 
           free(send_buffer);
+          g_streamed = true;
       } else {
           g_stream_sockfd = -1;       //something went wrong, disable streaming
-          ESP_LOGE("berry_log_stream", "disabled. Print buffer malloc failed (size=%d)", message_len + 1);
+          AddLog(LOG_LEVEL_ERROR, "WRPL: streaming disabled, malloc failed (size=%d)", message_len + 1);
       }
     return;
     }

@@ -11,6 +11,11 @@
 // Max number of concurrent clients (shared constant)
 #define MAX_WS_CLIENTS 5
 
+// REPL Mode constants
+#define REPL_OFF 0
+#define REPL_FRIENDLY 1
+#define REPL_RAW 2
+
 // --- Binary Protocol definitions ---
 // Mirroring MicroPython's WebREPL binary protocol header
 typedef struct __attribute__((packed)) { // Use packed to match potential uPy layout
@@ -40,20 +45,13 @@ typedef struct {
     char filename[128]; // Max filename length + safety margin
 } webrepl_binop_state_t;
 
-// --- Client State Enum ---
-typedef enum {
-    WS_STATE_INIT,       // Just connected, before prompt/trigger check
-    WS_STATE_PASSWORD,   // Sent prompt, awaiting password
-    WS_STATE_REPL,       // Password OK, processing WebREPL commands
-    WS_STATE_NORMAL_APP  // Determined not to be WebREPL
-} ws_client_state_t;
-
 // --- Client Tracking Structure (Shared) ---
 typedef struct {
-    int sockfd;
+    int client_id;              // equivalent to the slot
+    int sockfd;                 // socket assigned by sysyem
     bool active;
-    int64_t last_activity;  // Timestamp of any client activity in milliseconds
-    ws_client_state_t state; // Client state for WebREPL/Normal App
+    int64_t last_activity;      // Timestamp of any client activity in milliseconds
+    int repl_state;             // REPL mode: 0=OFF, 1=FRIENDLY, 2=RAW
     char *command_buffer;       // Dynamic buffer
     size_t command_len;         // Current length in buffer
     size_t buffer_capacity;     // Allocated capacity
@@ -76,11 +74,11 @@ extern volatile bool g_streamed;
 extern bool is_client_valid(int client_id);
 extern void handle_client_disconnect(int client_slot);
 extern void send_ws_text_frame(int sockfd, const char* text);
-extern void send_ws_text_frame_to_client(int client_id, const char* text);
+extern void send_ws_canned_text_frame(int client_id, const char* text);
 
 // Prototypes for functions defined in be_webrepl_lib.c
 extern void webrepl_init_client(int client_slot);
 extern void be_webrepl_handle_input(bvm *vm, int client_id, const char* code, size_t len);
 extern void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_t len);
 
-#endif // BE_WEBREPL_H_ 
+#endif // BE_WEBREPL_H_

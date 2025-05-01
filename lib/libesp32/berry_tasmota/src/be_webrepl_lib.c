@@ -48,8 +48,6 @@
 // --- WebREPL Specific Constants ---
 #define WEBREPL_PROMPT "> "
 #define WEBREPL_CONTINUATION_PROMPT "... "
-#define WEBREPL_PASSWORD_PROMPT "Password: "
-static const char* webrepl_password = "password"; // CHANGE THIS!
 
 // --- Initialize WebREPL-specific client data ---
 void webrepl_init_client(int client_slot) {
@@ -462,7 +460,10 @@ static bool ensure_line_buffer(ws_client_t *client, size_t additional_len) {
 }
 
 // cf be_repl.c's compile function
-static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
+static int webrepl_compile(bvm *vm, int client_id) {
+
+    ws_client_t *client = &ws_clients[client_id];
+
     // First try as an expression
     int res = try_return(vm, client->command_buffer);
     
@@ -481,7 +482,7 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
             // If there's an error and it's not multi-line, dump it
             if (res) {
                 be_dumpexcept(vm);
-                send_ws_text_frame(sockfd, "\r\n" WEBREPL_PROMPT);
+                send_ws_canned_text_frame(client->client_id, "\r\n" WEBREPL_PROMPT);
             }
             // Reset multi-line state - either completed successfully or has error
             client->in_multiline = false;
@@ -498,7 +499,7 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
         client->in_multiline = true;
         
         // Send continuation prompt
-        send_ws_text_frame(sockfd, WEBREPL_CONTINUATION_PROMPT);
+        send_ws_canned_text_frame(client->client_id, WEBREPL_CONTINUATION_PROMPT);
         
         // Remove the source code from stack - it's now in client->command_buffer
         be_remove(vm, idx);
@@ -524,21 +525,21 @@ static int webrepl_compile(bvm *vm, ws_client_t *client, int sockfd) {
         client->in_multiline = false;
         
         // Send normal prompt
-        send_ws_text_frame(sockfd, WEBREPL_PROMPT);
+        send_ws_canned_text_frame(client->client_id, WEBREPL_PROMPT);
     }
     
     return res;
 }
 
 // cf be_repl.c's call_script function
-static int webrepl_call_script(bvm *vm, int sockfd) {
+static int webrepl_call_script(bvm *vm, int client_id) {
 
     int res = be_pcall(vm, 0);  // Call the main function
 
     // if function printed anything, need to add a newline
     if (g_streamed){
         g_streamed = false;
-        send_ws_text_frame(sockfd, "\r\n");
+        send_ws_canned_text_frame(client_id, "\r\n");
     }
 
     switch (res) {
@@ -547,9 +548,8 @@ static int webrepl_call_script(bvm *vm, int sockfd) {
             if (!be_isnil(vm, -1)) { // if output from command, eg 3+4
                 const char *result = be_tostring(vm, -1);
                 if (result && *result) {
-                    // send_ws_text_frame(sockfd, "  ");
-                    send_ws_text_frame(sockfd, result);
-                    send_ws_text_frame(sockfd, "\r\n");
+                    send_ws_text_frame(ws_clients[client_id].sockfd, result);
+                    send_ws_canned_text_frame(client_id, "\r\n");
                 }
             } 
             be_pop(vm, 1);  // Pop result value
@@ -563,105 +563,113 @@ static int webrepl_call_script(bvm *vm, int sockfd) {
             return res;
     }   
     // Send prompt immediately after execution
-    send_ws_text_frame(sockfd, WEBREPL_PROMPT);
+    send_ws_canned_text_frame(client_id, WEBREPL_PROMPT);
     return 0;
 }
 
 // Helper function to compile and execute a Berry command
-static int compile_and_execute_command(bvm *vm, ws_client_t *client, int sockfd) {
-    if (!vm || !client || sockfd < 0) {
-        ESP_LOGE(TAG, "Invalid parameters in compile_and_execute_command");
-        return -1;
-    }
-    g_stream_sockfd = sockfd;   // enable print streaming to ws
+static int compile_and_execute_command(bvm *vm, int client_id) {
+
     g_streamed = false;
+    g_stream_sockfd = ws_clients[client_id].sockfd;   // enable Berry print streaming to ws
 
     // Compile the command - this will update client->in_multiline as needed
-    int res = webrepl_compile(vm, client, sockfd);
+    int res = webrepl_compile(vm, client_id);
     
     // Only execute if compilation succeeded and not in multi-line mode
-    if (res == BE_OK && !client->in_multiline) {
-        res = webrepl_call_script(vm, sockfd);
+    if (res == BE_OK && !ws_clients[client_id].in_multiline) {
+        res = webrepl_call_script(vm, client_id);
         if (res) {
             ESP_LOGE(TAG, "Execution error: %d", res);
         }
     }
-    g_stream_sockfd = -1;
+    g_stream_sockfd = -1;       //disable Berry print streaming to WS
 
     return res;
 }
 
 // Handles all incoming data for a client in REPL mode
 void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t len) {
-    // Basic validation
-    if (!vm || !data || client_id < 0 || client_id >= MAX_WS_CLIENTS) {
-        ESP_LOGE(TAG, "Invalid parameters in be_webrepl_handle_input: vm=%p, data=%p, client_id=%d", 
-                 vm, data, client_id);
-        return;
-    }
+
     if (!is_client_valid(client_id)) {
         ESP_LOGE(TAG, "Invalid client %d in be_webrepl_handle_input", client_id);
         return;
     }
-    int sockfd = ws_clients[client_id].sockfd;
-    if (sockfd < 0) {
-        ESP_LOGE(TAG, "Invalid sockfd for client %d in be_webrepl_handle_input", client_id);
-        return;
-    }
-
-    ESP_LOGD(TAG, "REPL Input Handler: Client %d, Socket %d, Data len = %d", 
-             client_id, sockfd, (int)len);
 
     ws_client_t *client = &ws_clients[client_id];
-    
-    // --- Handle special control characters ---
-    if (len == 1 && data[0] == 0x03) { // Ctrl+C
-        ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
-        
-        // Reset the client's command buffer if it exists
-        if (client->command_buffer) {
-            client->command_len = 0;
-            client->command_buffer[0] = '\0';
-            client->in_multiline = false;
-        }
-        
-        // Reset line buffer too
-        if (client->line_buffer) {
-            client->line_len = 0;
-            client->line_buffer[0] = '\0';
-        }
-        
-        // Send prompt
-        send_ws_text_frame(sockfd, "\r\n" WEBREPL_PROMPT);
+
+    // Ensure we have a line buffer
+    if (!ensure_line_buffer(client, 2)) {  // +2 for the char and null terminator
+        ESP_LOGE(TAG, "Failed to allocate line buffer for client %d", client_id);
         return;
     }
-    
-    // --- Handle character-by-character input ---
-    // If we received a single character (typical of interactive WebREPL clients)
+
+    // Check for single-character control codes *first*
     if (len == 1) {
-        // Ensure we have a line buffer
-        if (!ensure_line_buffer(client, 2)) {  // +2 for the char and null terminator
-            ESP_LOGE(TAG, "Failed to allocate line buffer for client %d", client_id);
-            return;
-        }
-        
         char c = data[0];
-        
-        // Handle backspace/delete
-        if (c == 0x08 || c == 0x7F) {
-            if (client->line_len > 0) {
-                client->line_len--;
-                client->line_buffer[client->line_len] = '\0';
-                // Echo backspace sequence to erase the last character
-                send_ws_text_frame(sockfd, "\b \b");
-            }
-            return;
+        bool handled = true; 
+        switch (c) {
+            case 0x01: // Ctrl+A: Enter RAW REPL
+                ESP_LOGI(TAG, "Client %d: Entering RAW REPL mode (^A)", client_id);
+                send_ws_canned_text_frame(client_id, "raw REPL; CTRL-B to exit\r\n"); 
+                break;
+            case 0x02: // Ctrl+B: Enter Friendly REPL
+                ESP_LOGI(TAG, "Client %d: Entering Friendly REPL mode (^B)", client_id);
+                send_ws_canned_text_frame(client_id, "OK\r\n>>> ");
+                break;
+            case 0x03: // Ctrl+C: Interrupt
+                ESP_LOGD(TAG, "Client %d: Interrupt received (^C)", client_id);
+                // Reset the client's command buffer if it exists
+                if (client->command_buffer) {
+                    client->command_len = 0;
+                    client->command_buffer[0] = '\0';
+                    client->in_multiline = false;
+                }
+                // Reset line buffer too
+                if (client->line_buffer) {
+                    client->line_len = 0;
+                    client->line_buffer[0] = '\0';
+                }
+                // Send prompt
+                if (client->repl_state == REPL_FRIENDLY) {
+                    send_ws_canned_text_frame(client_id, "\r\n" WEBREPL_PROMPT);
+                }
+                break;
+            case 0x04: // Ctrl+D: Soft reset / End of input
+                ESP_LOGI(TAG, "Client %d: Soft Reset / EOF received (^D)", client_id);
+                ws_clients[client_id].command_len = 0; // Clear buffer
+                ws_clients[client_id].command_buffer[0] = '\0';
+                // TODO: Add soft reset logic?
+                if (client->repl_state == REPL_FRIENDLY) {
+                    send_ws_canned_text_frame(client_id, "\r\n" WEBREPL_PROMPT);
+                }
+                break;
+            case 0x08:  // backspace
+            case 0x7f:  // delete left
+                if (client->line_len > 0) {
+                    client->line_len--;
+                    client->line_buffer[client->line_len] = '\0';
+                    // Echo backspace sequence to erase the last character
+                    if (client->repl_state == REPL_FRIENDLY) {
+                        send_ws_canned_text_frame(client_id, "\b \b");
+                    }
+                }
+                break;
+            default:
+                handled = false; 
+                break;
+        }
+        if (handled) {
+            ESP_LOGD(TAG, "REPL Input Handler End (Control Char): Client %d", client_id);
+            return; // Done handling control char
         }
         
         // Handle line termination (CR or LF)
         if (c == '\r' || c == '\n') {
             // Echo newline
-            send_ws_text_frame(sockfd, "\r\n");
+            if (client->repl_state == REPL_FRIENDLY) {
+                send_ws_canned_text_frame(client_id, "\r\n");
+            }
             
             // Process the line if we have accumulated content or if we're in multi-line mode
             if (client->line_len > 0 || client->in_multiline) {
@@ -673,7 +681,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                         return;
                     }
                     
-                    // Append a newline first if we have existing content in command buffer
+                    // Append a newline first if we have existing content
                     if (client->command_len > 0) {
                         client->command_buffer[client->command_len++] = '\n';
                     }
@@ -702,13 +710,15 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                 client->line_buffer[0] = '\0';
                 
                 // Use the common helper function to compile and execute
-                compile_and_execute_command(vm, client, sockfd);
+                compile_and_execute_command(vm, client_id );
             } else {
                 // Empty line, just show prompt if not in multi-line mode
                 if (!client->in_multiline) {
-                    send_ws_text_frame(sockfd, WEBREPL_PROMPT);
+                    if (client->repl_state == REPL_FRIENDLY) {
+                        send_ws_canned_text_frame(client_id, WEBREPL_PROMPT);
+                    }
                 } else {
-                    send_ws_text_frame(sockfd, WEBREPL_CONTINUATION_PROMPT);
+                    send_ws_canned_text_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
                 }
             }
             
@@ -721,7 +731,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
         
         // Echo the character back
         char echo[2] = {c, '\0'};
-        send_ws_text_frame(sockfd, echo);
+        send_ws_canned_text_frame(client_id, echo);
         
         return;
     }
@@ -762,7 +772,9 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
             client->command_buffer[client->command_len] = '\0';
             
             // Echo newline
-            send_ws_text_frame(sockfd, "\r\n");
+            if (client->repl_state == REPL_FRIENDLY) {
+                send_ws_canned_text_frame(client_id, "\r\n");
+            }
         } else {
             // Normal single-line processing
             if (line_len > 0 || (line_end < end)) {  // Non-empty line or empty line with terminator
@@ -780,14 +792,16 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                 }
                 
                 // Echo newline
-                send_ws_text_frame(sockfd, "\r\n");
+                if (client->repl_state == REPL_FRIENDLY) {
+                    send_ws_canned_text_frame(client_id, "\r\n");
+                }
             }
         }
         
         // If we have a line terminator, process the command
         if (line_end < end && (*line_end == '\r' || *line_end == '\n')) {
             // Use the common helper function to compile and execute
-            compile_and_execute_command(vm, client, sockfd);
+            compile_and_execute_command(vm, client_id);
             
             // Skip past line terminator(s)
             current = line_end + 1;
@@ -808,4 +822,4 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
     }
 }
 
-#endif // USE_BERRY_WEBREPL 
+#endif // USE_BERRY_WEBREPL
