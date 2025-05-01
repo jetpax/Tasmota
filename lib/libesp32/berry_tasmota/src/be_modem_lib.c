@@ -413,7 +413,6 @@ static int w_modem_get_gnss_info(bvm *vm) {
 static int w_modem_init(bvm *vm) {
     int top = be_top(vm);
     
-    esp_log_level_set(TAG, ESP_LOG_INFO);
     ESP_LOGI(TAG, "Initializing modem");
     
     // Create a PPP netif instance
@@ -452,7 +451,6 @@ static int w_modem_init(bvm *vm) {
 static int w_modem_init_usb(bvm *vm) {
     int top = be_top(vm);
     
-    esp_log_level_set(TAG, ESP_LOG_INFO);
     ESP_LOGI(TAG, "Initializing modem with USB DTE");
     
     // Extract parameters if provided (vid, pid, interface)

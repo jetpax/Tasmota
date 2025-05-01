@@ -21,7 +21,7 @@
 #ifdef USE_BERRY_WEBREPL
 
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_INFO
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #endif
 
 
@@ -618,7 +618,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                 send_ws_canned_text_frame(client_id, "OK\r\n>>> ");
                 break;
             case 0x03: // Ctrl+C: Interrupt
-                ESP_LOGD(TAG, "Client %d: Interrupt received (^C)", client_id);
+                ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
                 // Reset the client's command buffer if it exists
                 if (client->command_buffer) {
                     client->command_len = 0;

@@ -20,7 +20,7 @@
 #ifdef USE_BERRY_WSSERVER
 
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_INFO
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #endif
 
 
@@ -79,7 +79,6 @@ extern bool httpserver_queue_message(int msg_type, int client_id,
                                 const void *data, size_t data_len, void *user_data);
 extern void httpserver_register_external_close_cb(void (*func)(int sockfd));
 
-
 // Callback structure to properly store Berry callbacks
 typedef struct be_wsserver_callback_t {
   bvm *vm;                // VM instance
@@ -122,7 +121,6 @@ void send_ws_text_frame(int sockfd, const char* text) {
         return;
     }
     
-    // Log to help debug message routing
     ESP_LOGD(TAG, "Sending frame to socket %d: '%s'", sockfd, text);
     
     httpd_ws_frame_t frame;
@@ -134,7 +132,8 @@ void send_ws_text_frame(int sockfd, const char* text) {
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to send frame to sockfd %d: %s (%d)", 
                  sockfd, esp_err_to_name(ret), ret);
-    } }
+    } 
+}
 
 bool is_client_valid(int client_id) {
     // Check for valid client ID range
@@ -148,7 +147,6 @@ bool is_client_valid(int client_id) {
                 client_id, ws_clients[client_id].active, ws_clients[client_id].sockfd);
         return false;
     }
-    
     return true;
 }
 
@@ -158,11 +156,14 @@ void send_ws_canned_text_frame(int client_id, const char* text) {
                  client_id, is_client_valid(client_id), text);
         return;
     }
-    
-    int sockfd = ws_clients[client_id].sockfd;
-    
-    ESP_LOGI(TAG, "Sending frame to client %d (socket %d): '%s'", client_id, sockfd, text);
-    
+
+    // If the client is in RAW REPL mode, don't send canned/prompt messages.
+    if (ws_clients[client_id].repl_state == REPL_RAW) {
+        ESP_LOGD(TAG, "Client %d in RAW mode, suppressing canned frame: '%s'", client_id, text);
+        return; // Suppress output in RAW mode
+    }
+
+    int sockfd = ws_clients[client_id].sockfd;    
     send_ws_text_frame(sockfd, text);
 
 }
@@ -250,7 +251,6 @@ static void callBerryWsDispatcher(bvm *vm, int client_id, const char *event_name
 // Process a WebSocket message in the main task context
 // CONTEXT: Main Tasmota Task (Berry VM Context)
 // This function processes messages from the queue in the main task
-// It now routes messages based on client state
 void be_wsserver_handle_message(bvm *vm, int client_id, const char* data, size_t len, void *user_data) {
     if (!vm) {
         ESP_LOGE(TAG, "Berry VM is NULL in be_wsserver_handle_message");
@@ -472,9 +472,6 @@ static void wsserver_socket_cleanup_cb(int sockfd) {
     }
 }
 
-// Handle client disconnection - REMOVED (declared extern in be_webrepl.h)
-// static void handle_client_disconnect(int client_slot) { ... }
-// Definition needs to be non-static now and stays here
 void handle_client_disconnect(int client_slot) {
     if (client_slot < 0 || client_slot >= MAX_WS_CLIENTS || !ws_clients[client_slot].active) {
         // Already inactive or invalid slot
@@ -772,7 +769,6 @@ static int w_wsserver_start(bvm *vm) {
     be_pushbool(vm, true);
     be_return(vm);
 }
-
 
 static int w_wsserver_send(bvm *vm) {
     int initial_top = be_top(vm);
@@ -1149,7 +1145,6 @@ void be_wsserver_cb_deinit(bvm *vm) {
     ESP_LOGI(TAG, "[DEINIT] Completed callback deinitialization for VM %p: %d active callbacks processed, %d GC protected", 
              vm, count_active, count_gc_protected);
 }
-
 
 // Module definition
 /* @const_object_info_begin
