@@ -114,27 +114,6 @@ ws_client_t ws_clients[MAX_WS_CLIENTS]; // Define the actual storage
 // Storage for Berry callback functions
 static be_wsserver_callback_t wsserver_callbacks[3]; // CONNECT, DISCONNECT, MESSAGE
 
-void send_ws_text_frame(int sockfd, const char* text) {
-    if (sockfd < 0 || !ws_server || !text) {
-        ESP_LOGE(TAG, "Invalid parameters in send_ws_text_frame: sockfd=%d, ws_server=%p, text=%p", 
-                 sockfd, ws_server, text);
-        return;
-    }
-    
-    ESP_LOGD(TAG, "Sending frame to socket %d: '%s'", sockfd, text);
-    
-    httpd_ws_frame_t frame;
-    memset(&frame, 0, sizeof(frame));
-    frame.payload = (uint8_t*)text;
-    frame.len = strlen(text);
-    frame.type = HTTPD_WS_TYPE_TEXT;
-    esp_err_t ret = httpd_ws_send_frame_async(ws_server, sockfd, &frame);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to send frame to sockfd %d: %s (%d)", 
-                 sockfd, esp_err_to_name(ret), ret);
-    } 
-}
-
 bool is_client_valid(int client_id) {
     // Check for valid client ID range
     if (client_id < 0 || client_id >= MAX_WS_CLIENTS) {
@@ -148,24 +127,6 @@ bool is_client_valid(int client_id) {
         return false;
     }
     return true;
-}
-
-void send_ws_canned_text_frame(int client_id, const char* text) {
-    if (!is_client_valid(client_id) || !text) {
-        ESP_LOGE(TAG, "Invalid parameters in send_ws_canned_text_frame: client_id=%d, valid=%d, text=%p", 
-                 client_id, is_client_valid(client_id), text);
-        return;
-    }
-
-    // If the client is in RAW REPL mode, don't send canned/prompt messages.
-    if (ws_clients[client_id].repl_state == REPL_RAW) {
-        ESP_LOGD(TAG, "Client %d in RAW mode, suppressing canned frame: '%s'", client_id, text);
-        return; // Suppress output in RAW mode
-    }
-
-    int sockfd = ws_clients[client_id].sockfd;    
-    send_ws_text_frame(sockfd, text);
-
 }
 
 // Call a Berry callback function registered by wsserver.on()
