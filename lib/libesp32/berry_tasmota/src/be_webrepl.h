@@ -74,11 +74,20 @@ extern volatile bool g_streamed;
 extern bool is_client_valid(int client_id);
 extern void handle_client_disconnect(int client_slot);
 extern void send_ws_text_frame(int sockfd, const char* text);
-extern void send_ws_canned_text_frame(int client_id, const char* text);
+extern void send_ws_friendly_frame(int client_id, const char* text);
 
 // Prototypes for functions defined in be_webrepl_lib.c
 extern void webrepl_init_client(int client_slot);
 extern void be_webrepl_handle_input(bvm *vm, int client_id, const char* code, size_t len);
 extern void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_t len);
+
+#define WEBREPL_REQ_S_PASS "Password:" // "Password:\r\n"
+#define WEBREPL_PROMPT ">>> "
+#define WEBREPL_CONTINUATION_PROMPT "... "
+
+#define MAX_LINE_LENGTH 256  // Maximum length for a single line input
+#define MAX_COMMAND_LENGTH 1024 // Maximum length for accumulated multi-line command
+
+// REPL State enum
 
 #endif // BE_WEBREPL_H_

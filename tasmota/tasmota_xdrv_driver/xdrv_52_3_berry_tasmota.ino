@@ -1087,40 +1087,31 @@ void berry_log(const char * berry_buf) {
     // if the webrepl is active, redirect print output to the active websocket client
     int current_sockfd = g_stream_sockfd; // -1 means no stream
     httpd_handle_t current_server = ws_server;  
-
     if (current_sockfd >= 0 && current_server && berry_buf) {
-
       size_t buf_len = strlen(berry_buf);
-      size_t message_len = 2 + buf_len + 1; // CRLF prefix + buf + CR suffix
+      size_t message_len = buf_len + 1; // buf + suffix
       char* send_buffer = (char*)malloc(message_len + 1); // +1 for null terminator
-      
       if (send_buffer) {
-          // Add prefix
-          send_buffer[0] = '\r';
-          send_buffer[1] = '\n';
-          // Copy berry buffer content
-          memcpy(send_buffer + 2, berry_buf, buf_len);
-          // Add suffix
-          send_buffer[2 + buf_len] = '\r';
-          // Null terminate
-          send_buffer[message_len] = '\0'; 
+          memcpy(send_buffer, berry_buf, buf_len);
+          send_buffer[buf_len] = '\n'; 
+          send_buffer[message_len] = '\0';
           httpd_ws_frame_t ws_pkt;
           memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
           ws_pkt.payload = (uint8_t*)send_buffer;
-          ws_pkt.len = message_len; // Use the full message length including CRLFs
+          ws_pkt.len = message_len; // Full payload, no prefix
           ws_pkt.type = HTTPD_WS_TYPE_TEXT;
           esp_err_t ret = httpd_ws_send_frame_async(current_server, current_sockfd, &ws_pkt);
           if (ret != ESP_OK) {
-            AddLog(LOG_LEVEL_ERROR, "WRPL: httpd_ws_send_frame_async failed for %d: %s", current_sockfd, esp_err_to_name(ret) );
-          } 
+              AddLog(LOG_LEVEL_ERROR, "WRPL: send_frame_async failed for %d: %s", current_sockfd, esp_err_to_name(ret));
+          }
           free(send_buffer);
           g_streamed = true;
       } else {
-          g_stream_sockfd = -1;       //something went wrong, disable streaming
+          g_stream_sockfd = -1;
           AddLog(LOG_LEVEL_ERROR, "WRPL: streaming disabled, malloc failed (size=%d)", message_len + 1);
       }
-    return;
-    }
+      return;
+  }
 #endif // USE_BERRY_WEBREPL 
     const char * pre_delimiter = nullptr;   // do we need to prepend a delimiter if no REPL command
     size_t max_logs = berry.repl_active ? BERRY_MAX_REPL_LOGS : BERRY_MAX_LOGS;

@@ -17,13 +17,11 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-
 #ifdef USE_BERRY_WEBREPL
 
 #ifndef LOG_LOCAL_LEVEL
 #define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #endif
-
 
 #include <string.h>
 
@@ -36,11 +34,9 @@
 #include "be_vm.h"
 #include "be_exec.h"
 
-
 #include "be_webrepl.h" 
 
 #include "include/tasmota_version.h"        // Tasmota version information
-
 
 #define TAG "WEBREPL"
 
@@ -171,7 +167,7 @@ static bool webrepl_send_file_chunk(int client_id) {
 }
 
 // Called when ws_handler receives BINARY
-// Process incoming binary data (called from main task handler) - Implementation stays here
+// Process incoming binary data (called from main task handler) 
 void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_t len) {
     if (!is_client_valid(client_id)) return;
 
@@ -382,14 +378,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
 }
 
 void send_ws_text_frame(int sockfd, const char* text) {
-    if (sockfd < 0 || !ws_server || !text) {
-        ESP_LOGE(TAG, "Invalid parameters in send_ws_text_frame: sockfd=%d, ws_server=%p, text=%p", 
-                 sockfd, ws_server, text);
-        return;
-    }
-    
-    ESP_LOGD(TAG, "Sending frame to socket %d: '%s'", sockfd, text);
-    
+    ESP_LOGD(TAG, "Sending frame to socket %d: '%s'", sockfd, text);  
     httpd_ws_frame_t frame;
     memset(&frame, 0, sizeof(frame));
     frame.payload = (uint8_t*)text;
@@ -402,16 +391,16 @@ void send_ws_text_frame(int sockfd, const char* text) {
     } 
 }
 
-void send_ws_canned_text_frame(int client_id, const char* text) {
+void send_ws_friendly_frame(int client_id, const char* text) {
     if (!is_client_valid(client_id) || !text) {
-        ESP_LOGE(TAG, "Invalid parameters in send_ws_canned_text_frame: client_id=%d, valid=%d, text=%p", 
+        ESP_LOGE(TAG, "Invalid parameters in send_ws_friendly_frame: client_id=%d, valid=%d, text=%p", 
                  client_id, is_client_valid(client_id), text);
         return;
     }
 
-    // If the client is in RAW REPL mode, don't send canned/prompt messages.
+    // If the client is in RAW REPL mode, don't send friendly messages.
     if (ws_clients[client_id].repl_state == REPL_RAW) {
-        ESP_LOGD(TAG, "Client %d in RAW mode, suppressing canned frame: '%s'", client_id, text);
+        ESP_LOGD(TAG, "Client %d in RAW mode, suppressing friendly msgs: '%s'", client_id, text);
         return; // Suppress output in RAW mode
     }
 
@@ -536,13 +525,13 @@ static int webrepl_compile(bvm *vm, int client_id) {
             // If there's an error and it's not multi-line, dump it
             if (res) {
                 be_dumpexcept(vm);
-                send_ws_canned_text_frame(client->client_id, "\r\n" WEBREPL_PROMPT);
+                send_ws_friendly_frame(client->client_id, "\r\n" WEBREPL_PROMPT);
             }
             // Reset multi-line state - either completed successfully or has error
             client->in_multiline = false;
             // Reset the command buffer
             client->command_len = 0;
-            client->command_buffer[0] = '\0';          
+            client->command_buffer[0] = '\0';
             return res;
         }
         
@@ -553,7 +542,7 @@ static int webrepl_compile(bvm *vm, int client_id) {
         client->in_multiline = true;
         
         // Send continuation prompt
-        send_ws_canned_text_frame(client->client_id, WEBREPL_CONTINUATION_PROMPT);
+        send_ws_friendly_frame(client->client_id, WEBREPL_CONTINUATION_PROMPT);
         
         // Remove the source code from stack - it's now in client->command_buffer
         be_remove(vm, idx);
@@ -579,7 +568,7 @@ static int webrepl_compile(bvm *vm, int client_id) {
         client->in_multiline = false;
         
         // Send normal prompt
-        send_ws_canned_text_frame(client->client_id, WEBREPL_PROMPT);
+        send_ws_friendly_frame(client->client_id, WEBREPL_PROMPT);
     }
     
     return res;
@@ -590,10 +579,10 @@ static int webrepl_call_script(bvm *vm, int client_id) {
 
     int res = be_pcall(vm, 0);  // Call the main function
 
-    // if function printed anything, need to add a newline
     if (g_streamed){
         g_streamed = false;
-        send_ws_canned_text_frame(client_id, "\r\n");
+        // if function printed anything, need to add a newline (not RAW mode)
+        send_ws_friendly_frame(client_id, "\r\n");
     }
 
     switch (res) {
@@ -603,22 +592,41 @@ static int webrepl_call_script(bvm *vm, int client_id) {
                 const char *result = be_tostring(vm, -1);
                 if (result && *result) {
                     send_ws_text_frame(ws_clients[client_id].sockfd, result);
-                    send_ws_canned_text_frame(client_id, "\r\n");
+                    send_ws_friendly_frame(client_id, "\r\n");
                 }
             } 
             be_pop(vm, 1);  // Pop result value
-            break;
-        case BE_EXCEPTION: /* vm run error */
-            // Maybe a 'return' expression error
+            if (ws_clients[client_id].repl_state == REPL_RAW) {
+                send_ws_text_frame(ws_clients[client_id].sockfd, "\x04");
+            }
+            break; // Exit switch for BE_OK
+
+        case BE_EXCEPTION:
+            // Send stderr via be_dumpexcept
             be_dumpexcept(vm);
-            be_pop(vm, 1); /* pop the function value */
-            break;
+            be_pop(vm, 1); // pop the exception object
+
+            if (ws_clients[client_id].repl_state == REPL_RAW) {
+                send_ws_text_frame(ws_clients[client_id].sockfd, "\x04");
+            }
+            break; // Exit switch for BE_EXCEPTION
+
         default: /* BE_EXIT or BE_MALLOC_FAIL */
-            return res;
-    }   
-    // Send prompt immediately after execution
-    send_ws_canned_text_frame(client_id, WEBREPL_PROMPT);
-    return 0;
+            // Treat other cases like errors - send the first \x04
+             if (ws_clients[client_id].repl_state == REPL_RAW) {
+                send_ws_text_frame(ws_clients[client_id].sockfd, "\x04");
+             }
+            // Don't return here, fall through to send the second \x04
+    }
+
+    // Send SECOND RAW REPL terminator (after stderr or first \x04)
+    // This marks the end of the command execution response.
+    if (ws_clients[client_id].repl_state == REPL_RAW) {
+       send_ws_text_frame(ws_clients[client_id].sockfd, "\x04");
+    }
+
+    // Return appropriate status from the pcall
+    return (res == BE_OK || res == BE_EXCEPTION) ? 0 : res; // Indicate success (0) for OK/Exception handled, else return original code
 }
 
 // Helper function to compile and execute a Berry command
@@ -651,229 +659,350 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
     }
 
     ws_client_t *client = &ws_clients[client_id];
+    ESP_LOGD(TAG, "REPL Input Handler Start: Client %d, Mode: %s, len: %d", 
+             client_id, (client->repl_state == REPL_RAW ? "RAW" : "Friendly"), len);
 
-    // Ensure we have a line buffer
-    if (!ensure_line_buffer(client, 2)) {  // +2 for the char and null terminator
-        ESP_LOGE(TAG, "Failed to allocate line buffer for client %d", client_id);
-        return;
-    }
-
-    // Check for single-character control codes *first*
-    if (len == 1) {
-        char c = data[0];
-        bool handled = true; 
-        switch (c) {
-            case 0x01: // Ctrl+A: Enter RAW REPL
-                ESP_LOGI(TAG, "Client %d: Entering RAW REPL mode (^A)", client_id);
-                send_ws_canned_text_frame(client_id, "raw REPL; CTRL-B to exit\r\n"); 
-                break;
-            case 0x02: // Ctrl+B: Enter Friendly REPL
-                ESP_LOGI(TAG, "Client %d: Entering Friendly REPL mode (^B)", client_id);
-                send_ws_canned_text_frame(client_id, "OK\r\n>>> ");
-                break;
-            case 0x03: // Ctrl+C: Interrupt
-                ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
-                // Reset the client's command buffer if it exists
-                if (client->command_buffer) {
-                    client->command_len = 0;
-                    client->command_buffer[0] = '\0';
-                    client->in_multiline = false;
-                }
-                // Reset line buffer too
-                if (client->line_buffer) {
-                    client->line_len = 0;
-                    client->line_buffer[0] = '\0';
-                }
-                // Send prompt
-                if (client->repl_state == REPL_FRIENDLY) {
-                    send_ws_canned_text_frame(client_id, "\r\n" WEBREPL_PROMPT);
-                }
-                break;
-            case 0x04: // Ctrl+D: Soft reset / End of input
-                ESP_LOGI(TAG, "Client %d: Soft Reset / EOF received (^D)", client_id);
-                ws_clients[client_id].command_len = 0; // Clear buffer
-                ws_clients[client_id].command_buffer[0] = '\0';
-                // TODO: Add soft reset logic?
-                if (client->repl_state == REPL_FRIENDLY) {
-                    send_ws_canned_text_frame(client_id, "\r\n" WEBREPL_PROMPT);
-                }
-                break;
-            case 0x08:  // backspace
-            case 0x7f:  // delete left
-                if (client->line_len > 0) {
-                    client->line_len--;
-                    client->line_buffer[client->line_len] = '\0';
-                    // Echo backspace sequence to erase the last character
-                    if (client->repl_state == REPL_FRIENDLY) {
-                        send_ws_canned_text_frame(client_id, "\b \b");
-                    }
-                }
-                break;
-            default:
-                handled = false; 
-                break;
+    if (client->repl_state == REPL_RAW) {
+        // --- RAW REPL Mode Handling --- 
+        
+        // Append ALL incoming data to client->command_buffer.
+        if (!ensure_command_buffer(client, client->command_len + len + 1)) { // +1 for null terminator
+            ESP_LOGE(TAG, "RAW Mode: Failed to allocate command buffer for client %d", client_id);
+            // Potentially send an error back or disconnect?
+            return;
         }
-        if (handled) {
-            ESP_LOGD(TAG, "REPL Input Handler End (Control Char): Client %d", client_id);
-            return; // Done handling control char
+        memcpy(client->command_buffer + client->command_len, data, len);
+        client->command_len += len;
+        client->command_buffer[client->command_len] = '\0'; // Ensure null termination
+
+        ESP_LOGD(TAG, "RAW Mode: Buffer after append (len=%d): '%s'", client->command_len, client->command_buffer);
+
+        // Check if command_buffer ends with "\n\x04".
+        if (client->command_len >= 2 && 
+            client->command_buffer[client->command_len - 2] == '\n' &&
+            client->command_buffer[client->command_len - 1] == '\x04') 
+        {
+            ESP_LOGD(TAG, "RAW Mode: End sequence '\\n\\x04' detected for client %d", client_id);
+            
+            send_ws_text_frame(client->sockfd, "OK"); 
+
+            client->command_buffer[client->command_len - 2] = '\0';
+            client->command_len -= 2; // Adjust length
+
+            ESP_LOGD(TAG, "RAW Mode: Executing command (len=%d): '%s'", client->command_len, client->command_buffer);
+            
+            compile_and_execute_command(vm, client_id);
+            
+            client->command_len = 0;
+            client->command_buffer[0] = '\0';
+
+        } else {
+            // Sequence not found, keep accumulating
+            ESP_LOGD(TAG, "RAW Mode: End sequence not found, accumulating...");
+        }
+
+    } else { 
+        // --- Friendly REPL Mode Handling (Existing Logic) ---
+        int initial_top = be_top(vm); // Stack check for friendly mode
+
+        // Check for single-character control codes *first*
+        if (len == 1) {
+            char c = data[0];
+            bool handled = true; 
+            switch (c) {
+                case 0x01: // Ctrl+A: Enter RAW REPL
+                    ESP_LOGI(TAG, "Client %d: Entering RAW REPL mode (^A)", client_id);
+                    client->repl_state = REPL_RAW;
+                    // Clear buffers when switching mode
+                    client->command_len = 0;
+                    if (client->command_buffer) client->command_buffer[0] = '\0';
+                    client->line_len = 0;
+                    if (client->line_buffer) client->line_buffer[0] = '\0';
+                    client->in_multiline = false;
+                    send_ws_friendly_frame(client_id, "raw REPL; CTRL-B to exit\r\n"); 
+                    break;
+                case 0x02: // Ctrl+B: Enter Friendly REPL (already in it, but maybe reset state?)
+                    ESP_LOGI(TAG, "Client %d: Resetting Friendly REPL mode (^B)", client_id);
+                    client->repl_state = REPL_FRIENDLY; // Ensure state
+                    // Clear buffers
+                    client->command_len = 0;
+                    if (client->command_buffer) client->command_buffer[0] = '\0';
+                    client->line_len = 0;
+                    if (client->line_buffer) client->line_buffer[0] = '\0';
+                    client->in_multiline = false;
+                    send_ws_friendly_frame(client_id, "\r\nOK\r\n" WEBREPL_PROMPT);
+                    break;
+                case 0x03: // Ctrl+C: Interrupt
+                    ESP_LOGI(TAG, "Client %d: Interrupt received (^C)", client_id);
+                    // Reset the client's command buffer if it exists
+                    if (client->command_buffer) {
+                        client->command_len = 0;
+                        client->command_buffer[0] = '\0';
+                        client->in_multiline = false;
+                    }
+                    // Reset line buffer too
+                    if (client->line_buffer) {
+                        client->line_len = 0;
+                        client->line_buffer[0] = '\0';
+                    }
+                    // Send prompt
+                    send_ws_friendly_frame(client_id, "\r\n" WEBREPL_PROMPT);
+                    break;
+                case 0x04: // Ctrl+D: Soft reset / End of input (Friendly mode)
+                    ESP_LOGI(TAG, "Client %d: Soft Reset / EOF received (^D)", client_id);
+                if (client->repl_state == REPL_FRIENDLY) {
+                    send_ws_friendly_frame(client->client_id, "\r\n" WEBREPL_PROMPT);
+                }       
+                
+
+                // TODO: Add soft reset logic?
+       
+                    break;
+                case 0x08:  // backspace
+                case 0x7f:  // delete left
+                    if (client->line_len > 0) {
+                        client->line_len--;
+                        client->line_buffer[client->line_len] = '\0';
+                        // Echo backspace sequence to erase the last character
+                        send_ws_friendly_frame(client->client_id, "\b \b");
+                    }
+                    break;
+                default:
+                    handled = false; 
+                    break;
+            }
+            if (handled) {
+                ESP_LOGD(TAG, "Friendly REPL Input Handler End (Control Char): Client %d", client_id);
+                return; // Done handling control char
+            }
         }
         
-        // Handle line termination (CR or LF)
-        if (c == '\r' || c == '\n') {
-            // Echo newline
-            if (client->repl_state == REPL_FRIENDLY) {
-                send_ws_canned_text_frame(client_id, "\r\n");
+        // If len == 1 and not a handled control char, it's a regular char
+        if (len == 1) { 
+            char c = data[0];
+
+            // Handle line termination (CR or LF)
+            if (c == '\r' || c == '\n') {
+                // Echo newline
+                send_ws_friendly_frame(client_id, "\r\n");
+                
+                // Process the line if we have accumulated content or if we're in multi-line mode
+                if (client->line_len > 0 || client->in_multiline) {
+                    // Check for multi-line triggering or continuation
+                    int indent_level = 0;
+                    bool is_multiline_trigger = false;
+                    if (client->line_len > 0) {
+                        // Check indentation for multi-line start/continuation
+                        for (int i = 0; i < client->line_len && (client->line_buffer[i] == ' ' || client->line_buffer[i] == '\t'); ++i) {
+                            indent_level++;
+                        }
+                        // Basic trigger: ends with ':' or is indented
+                        is_multiline_trigger = (client->line_buffer[client->line_len - 1] == ':') || (indent_level > 0);
+                    }
+                    
+                    // Special handling for multi-line input
+                    if (client->in_multiline) {
+                        // Append the new line with a newline character
+                        if (!ensure_command_buffer(client, client->command_len + client->line_len + 2)) {
+                            ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
+                            return;
+                        }
+                        // Append a newline first if we have existing content
+                        if (client->command_len > 0) {
+                            client->command_buffer[client->command_len++] = '\n';
+                        }
+                        // Then append the accumulated line
+                        if (client->line_len > 0) {
+                             memcpy(client->command_buffer + client->command_len, client->line_buffer, client->line_len);
+                            client->command_len += client->line_len;
+                        }
+                         client->command_buffer[client->command_len] = '\0';
+
+                         if (client->line_len == 0 || indent_level == 0) {
+                             ESP_LOGD(TAG, "Multi-line block ended. Executing.");
+                            client->in_multiline = false;
+                            compile_and_execute_command(vm, client_id );
+                        } else {
+                             ESP_LOGD(TAG, "Multi-line continuing...");
+                            send_ws_friendly_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
+                        }
+
+                    } else if (is_multiline_trigger) {
+                         ESP_LOGD(TAG, "Multi-line block started.");
+                        client->in_multiline = true;
+                        // Copy the first line to the command buffer
+                        if (!ensure_command_buffer(client, client->line_len + 2)) { // + newline + null
+                            ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
+                             client->in_multiline = false; // Reset state
+                            return;
+                        }
+                        memcpy(client->command_buffer, client->line_buffer, client->line_len);
+                        client->command_len = client->line_len;
+                        client->command_buffer[client->command_len] = '\0';
+                        send_ws_friendly_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
+                    } else {
+                        // Normal single-line processing
+                        // Copy line buffer to command buffer
+                        if (!ensure_command_buffer(client, client->line_len + 1)) {
+                            ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
+                            return;
+                        }
+                        memcpy(client->command_buffer, client->line_buffer, client->line_len);
+                        client->command_len = client->line_len;
+                        client->command_buffer[client->command_len] = '\0';
+                        
+                        // Execute single line command
+                        compile_and_execute_command(vm, client_id );
+                    }
+                    
+                    // Reset line buffer for next line/command
+                    client->line_len = 0;
+                    client->line_buffer[0] = '\0';
+
+                } else { // Empty line received
+                    if (client->in_multiline) {
+                        // Empty line finishes multi-line input
+                        ESP_LOGD(TAG, "Multi-line block ended by empty line. Executing.");
+                        client->in_multiline = false;
+                        // command_buffer already holds the multi-line code
+                        compile_and_execute_command(vm, client_id);
+                    } else {
+                         // Empty line in single-line mode, just show prompt
+                        send_ws_friendly_frame(client_id, WEBREPL_PROMPT);
+                    }
+                    // Reset line buffer
+                     client->line_len = 0;
+                    client->line_buffer[0] = '\0';
+                }
+                
+                return; // Handled line termination
             }
             
-            // Process the line if we have accumulated content or if we're in multi-line mode
-            if (client->line_len > 0 || client->in_multiline) {
-                // Special handling for multi-line input
-                if (client->in_multiline) {
-                    // For multi-line, we need to append the new line with a newline character
-                    if (!ensure_command_buffer(client, client->command_len + client->line_len + 2)) {
-                        ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
-                        return;
+            // Regular character, append to line buffer and echo
+            if (client->line_len < (MAX_LINE_LENGTH - 1)) {
+                client->line_buffer[client->line_len++] = c;
+                client->line_buffer[client->line_len] = '\0';
+                
+                // Echo the character back
+                char echo[2] = {c, '\0'};
+                send_ws_friendly_frame(client_id, echo);
+            } else {
+                 ESP_LOGW(TAG, "Line buffer overflow for client %d", client_id);
+                 // Optionally send a bell character or error?
+            }
+            
+            return; // Handled single regular char append
+        }
+        
+        // --- Handle normal multi-byte line input (pasted text) --- 
+        // This part remains largely the same, processing line-by-line based on \r\n
+        const char *current = data;
+        const char *end = data + len;
+        
+        while (current < end) {
+            // Find the next line terminator
+            const char *line_end = current;
+            while (line_end < end && *line_end != '\r' && *line_end != '\n') {
+                line_end++;
+            }
+            
+            size_t current_line_len = line_end - current;
+            
+            // Append the current segment to the line buffer
+            if (client->line_len + current_line_len < (MAX_LINE_LENGTH - 1)) {
+                memcpy(client->line_buffer + client->line_len, current, current_line_len);
+                client->line_len += current_line_len;
+                client->line_buffer[client->line_len] = '\0';
+            } else {
+                ESP_LOGW(TAG, "Line buffer overflow during paste for client %d", client_id);
+                 // Truncate and proceed?
+                 size_t space_left = (MAX_LINE_LENGTH - 1) - client->line_len;
+                 if (space_left > 0) {
+                     memcpy(client->line_buffer + client->line_len, current, space_left);
+                     client->line_len += space_left;
+                     client->line_buffer[client->line_len] = '\0';
+                 }
+                 // How to handle the rest of the pasted data? Discard for now.
+                 current = end; // Skip rest of the pasted data in this chunk
+                 // Maybe send an error message?
+            }
+
+            // If we found a line terminator, process the line buffer
+            if (line_end < end && (*line_end == '\r' || *line_end == '\n')) {
+                // Echo newline
+                send_ws_friendly_frame(client->client_id, "\r\n");
+                
+                 // Process the line (similar logic as single char line termination)
+                if (client->line_len > 0 || client->in_multiline) {
+                     int indent_level = 0;
+                    bool is_multiline_trigger = false;
+                     if (client->line_len > 0) {
+                        for (int i = 0; i < client->line_len && (client->line_buffer[i] == ' ' || client->line_buffer[i] == '\t'); ++i) {
+                            indent_level++;
+                        }
+                        is_multiline_trigger = (client->line_buffer[client->line_len - 1] == ':') || (indent_level > 0);
                     }
-                    
-                    // Append a newline first if we have existing content
-                    if (client->command_len > 0) {
-                        client->command_buffer[client->command_len++] = '\n';
+
+                    if (client->in_multiline) {
+                        if (!ensure_command_buffer(client, client->command_len + client->line_len + 2)) { /* ... error handling ... */ return; }
+                        if (client->command_len > 0) client->command_buffer[client->command_len++] = '\n';
+                        if (client->line_len > 0) {
+                             memcpy(client->command_buffer + client->command_len, client->line_buffer, client->line_len);
+                            client->command_len += client->line_len;
+                        }
+                         client->command_buffer[client->command_len] = '\0';
+
+                         if (client->line_len == 0 || indent_level == 0) {
+                             client->in_multiline = false;
+                            compile_and_execute_command(vm, client_id );
+                        } else {
+                             send_ws_friendly_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
+                        }
+                    } else if (is_multiline_trigger) {
+                         client->in_multiline = true;
+                        if (!ensure_command_buffer(client, client->line_len + 2)) { /* ... error handling ... */ return; }
+                        memcpy(client->command_buffer, client->line_buffer, client->line_len);
+                        client->command_len = client->line_len;
+                        client->command_buffer[client->command_len] = '\0';
+                        send_ws_friendly_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
+                    } else {
+                        if (!ensure_command_buffer(client, client->line_len + 1)) { /* ... error handling ... */ return; }
+                        memcpy(client->command_buffer, client->line_buffer, client->line_len);
+                        client->command_len = client->line_len;
+                        client->command_buffer[client->command_len] = '\0';
+                        compile_and_execute_command(vm, client_id);
                     }
-                    
-                    // Then append the accumulated line
-                    if (client->line_len > 0) {
-                        memcpy(client->command_buffer + client->command_len, client->line_buffer, client->line_len);
-                        client->command_len += client->line_len;
+                } else { // Empty line received
+                     if (client->in_multiline) {
+                        client->in_multiline = false;
+                        compile_and_execute_command(vm, client_id);
+                    } else {
+                         send_ws_friendly_frame(client_id, WEBREPL_PROMPT);
                     }
-                    client->command_buffer[client->command_len] = '\0';
-                } else {
-                    // Normal single-line processing
-                    // Copy line buffer to command buffer
-                    if (!ensure_command_buffer(client, client->line_len + 1)) {
-                        ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
-                        return;
-                    }
-                    
-                    memcpy(client->command_buffer, client->line_buffer, client->line_len);
-                    client->command_len = client->line_len;
-                    client->command_buffer[client->command_len] = '\0';
                 }
                 
                 // Reset line buffer for next line
                 client->line_len = 0;
                 client->line_buffer[0] = '\0';
                 
-                // Use the common helper function to compile and execute
-                compile_and_execute_command(vm, client_id );
+                // Skip past line terminator(s)
+                current = line_end + 1;
+                if (current < end && *line_end == '\r' && *current == '\n') {
+                    current++;  // Skip LF in CRLF sequence
+                }
             } else {
-                // Empty line, just show prompt if not in multi-line mode
-                if (!client->in_multiline) {
-                    if (client->repl_state == REPL_FRIENDLY) {
-                        send_ws_canned_text_frame(client_id, WEBREPL_PROMPT);
-                    }
-                } else {
-                    send_ws_canned_text_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
-                }
+                // No line terminator found in this chunk, advance current
+                current = line_end;
             }
-            
-            return;
+        } // End while (current < end)
+
+        // Check for stack balance after friendly mode processing
+        if (be_top(vm) != initial_top) {
+            ESP_LOGE(TAG, "Stack imbalance after Friendly REPL handling! Top: %d, Expected: %d",
+                     be_top(vm), initial_top);
+            be_pop(vm, be_top(vm) - initial_top);  // Restore stack balance
         }
-        
-        // Regular character, append to line buffer and echo
-        client->line_buffer[client->line_len++] = c;
-        client->line_buffer[client->line_len] = '\0';
-        
-        // Echo the character back
-        char echo[2] = {c, '\0'};
-        send_ws_canned_text_frame(client_id, echo);
-        
-        return;
-    }
-    
-    // --- Handle normal line-by-line input (not character-by-character) ---
-    const char *current = data;
-    const char *end = data + len;
-    int initial_top = be_top(vm);
-    
-    while (current < end) {
-        // Find the next line terminator
-        const char *line_end = current;
-        while (line_end < end && *line_end != '\r' && *line_end != '\n') {
-            line_end++;
-        }
-        
-        // Process this line if it's not empty
-        size_t line_len = line_end - current;
-        
-        // Special handling for multi-line continuation
-        if (client->in_multiline) {
-            // For multi-line, we need to append the new line with a newline character
-            if (!ensure_command_buffer(client, client->command_len + line_len + 2)) {
-                ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
-                return;
-            }
-            
-            // Append a newline first if we have existing content
-            if (client->command_len > 0) {
-                client->command_buffer[client->command_len++] = '\n';
-            }
-            
-            // Then append the new line
-            if (line_len > 0) {
-                memcpy(client->command_buffer + client->command_len, current, line_len);
-                client->command_len += line_len;
-            }
-            client->command_buffer[client->command_len] = '\0';
-            
-            // Echo newline
-            if (client->repl_state == REPL_FRIENDLY) {
-                send_ws_canned_text_frame(client_id, "\r\n");
-            }
-        } else {
-            // Normal single-line processing
-            if (line_len > 0 || (line_end < end)) {  // Non-empty line or empty line with terminator
-                // Ensure command buffer has enough space
-                if (!ensure_command_buffer(client, line_len + 2)) {  // +2 for newline and null terminator
-                    ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
-                    return;
-                }
-                
-                // Append line to buffer
-                if (line_len > 0) {
-                    memcpy(client->command_buffer + client->command_len, current, line_len);
-                    client->command_len += line_len;
-                    client->command_buffer[client->command_len] = '\0';
-                }
-                
-                // Echo newline
-                if (client->repl_state == REPL_FRIENDLY) {
-                    send_ws_canned_text_frame(client_id, "\r\n");
-                }
-            }
-        }
-        
-        // If we have a line terminator, process the command
-        if (line_end < end && (*line_end == '\r' || *line_end == '\n')) {
-            // Use the common helper function to compile and execute
-            compile_and_execute_command(vm, client_id);
-            
-            // Skip past line terminator(s)
-            current = line_end + 1;
-            if (current < end && *line_end == '\r' && *current == '\n') {
-                current++;  // Skip LF in CRLF sequence
-            }
-        } else {
-            // No line terminator, means we've processed all data
-            current = line_end;
-        }
-    }
-    
-    // Check for stack balance
-    if (be_top(vm) != initial_top) {
-        ESP_LOGE(TAG, "Stack imbalance after REPL handling! Top: %d, Expected: %d",
-                 be_top(vm), initial_top);
-        be_pop(vm, be_top(vm) - initial_top);  // Restore stack balance
-    }
+    } // End else (Friendly REPL Mode)
 }
 
 #endif // USE_BERRY_WEBREPL
