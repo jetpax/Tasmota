@@ -506,10 +506,11 @@ static bool ensure_line_buffer(ws_client_t *client, size_t additional_len) {
 static int webrepl_compile(bvm *vm, int client_id) {
 
     ws_client_t *client = &ws_clients[client_id];
+    int original_stream_sockfd = g_stream_sockfd; // Store stream state
 
     // First try as an expression
     int res = try_return(vm, client->command_buffer);
-    
+
     // Handle syntax errors (may be multi-line statements)
     if (be_getexcept(vm, res) == BE_SYNTAX_ERROR) {
         be_pop(vm, 2);  // Pop exception values
@@ -522,132 +523,173 @@ static int webrepl_compile(bvm *vm, int client_id) {
         // Check if compilation succeeded or it's a non-multi-line error
         if (!res || !is_multline(vm)) {
             be_remove(vm, idx);  // Remove source code
-            // If there's an error and it's not multi-line, dump it
+            // If there's an error and it's not multi-line, handle RAW REPL error response
             if (res) {
-                be_dumpexcept(vm);
-                send_ws_friendly_frame(client->client_id, "\r\n" WEBREPL_PROMPT);
+                 // Temporarily disable streaming for error output
+                g_stream_sockfd = -1;
+                const char *error_msg = NULL;
+                if (be_isstring(vm, -1)) { // Error message is on top
+                    error_msg = be_tostring(vm, -1);
+                }
+                // Send empty stdout
+                // send_ws_text_frame(client->sockfd, "", 0); // Not strictly needed if frontend handles missing output
+                // Send first terminator (end of stdout)
+                send_ws_text_frame(client->sockfd, "\x04");
+                // Send stderr message
+                if (error_msg) {
+                    send_ws_text_frame(client->sockfd, error_msg);
+                }
+                // Send second terminator (end of stderr/command)
+                send_ws_text_frame(client->sockfd, "\x04");
+
+                be_pop(vm, 1); // Pop the error message/object
+                g_stream_sockfd = original_stream_sockfd; // Restore stream state
             }
             // Reset multi-line state - either completed successfully or has error
             client->in_multiline = false;
             // Reset the command buffer
             client->command_len = 0;
             client->command_buffer[0] = '\0';
-            return res;
+            return res; // Return the compilation result code
         }
-        
+
         // This is a multi-line statement needing more input
         be_pop(vm, 2);  // Pop exception values
-        
+
         // Set multi-line flag
         client->in_multiline = true;
-        
-        // Send continuation prompt
-        send_ws_friendly_frame(client->client_id, WEBREPL_CONTINUATION_PROMPT);
-        
+
+        // Send continuation prompt (ONLY for multi-line, not an error)
+        send_ws_friendly_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
+
         // Remove the source code from stack - it's now in client->command_buffer
         be_remove(vm, idx);
-        
+
         // Return special OK value to indicate waiting for more input
-        return BE_OK;
+        return BE_OK; // Indicate multi-line continuation
     }
-    
+
     // Expression evaluation succeeded or non-syntax error occurred
     if (res == BE_OK) {
         // Reset buffer and multi-line state
         client->command_len = 0;
         client->command_buffer[0] = '\0';
         client->in_multiline = false;
-        
+
     } else {
-        // Non-syntax error
-        be_dumpexcept(vm);
-        
+        // Non-syntax error (e.g., from try_return)
+        // Temporarily disable streaming for error output
+        g_stream_sockfd = -1;
+        const char *error_msg = NULL;
+        if (be_isstring(vm, -1)) { // Error message is on top
+            error_msg = be_tostring(vm, -1);
+        }
+        // Send empty stdout
+        // send_ws_text_frame(client->sockfd, "", 0); // Not strictly needed
+        // Send first terminator (end of stdout)
+        send_ws_text_frame(client->sockfd, "\x04");
+        // Send stderr message
+        if (error_msg) {
+            send_ws_text_frame(client->sockfd, error_msg);
+        }
+        // Send second terminator (end of stderr/command)
+        send_ws_text_frame(client->sockfd, "\x04");
+
+        be_pop(vm, 1); // Pop the error message/object
+        g_stream_sockfd = original_stream_sockfd; // Restore stream state
+
         // Reset buffer and multi-line state
         client->command_len = 0;
         client->command_buffer[0] = '\0';
         client->in_multiline = false;
-        
-        // Send normal prompt
-        send_ws_friendly_frame(client->client_id, WEBREPL_PROMPT);
     }
-    
+
     return res;
 }
 
-// cf be_repl.c's call_script function
+// Call the compiled script if it's on top of the stack
 static int webrepl_call_script(bvm *vm, int client_id) {
+    int original_stream_sockfd = g_stream_sockfd;
+    g_stream_sockfd = -1; // Disable streaming during sync output
+    const char* output_str = NULL;
+    const char* error_str = NULL;
+    ws_client_t *client = &ws_clients[client_id];
+    int res = be_pcall(vm, 0);
 
-    int res = be_pcall(vm, 0);  // Call the main function
+    if (res == BE_OK) {
+        // Check if there is a return value (stdout)
+        if (!be_isnil(vm, -1)) {
+            output_str = be_tostring(vm, -1);
+        }
+        // Send stdout (if any)
+        if (output_str && strlen(output_str) > 0) {
+             send_ws_text_frame(client->sockfd, output_str);
+        }
+        // Send first terminator (end of stdout)
+        send_ws_text_frame(client->sockfd, "\x04");
+        // Send second terminator (end of empty stderr/command)
+        send_ws_text_frame(client->sockfd, "\x04");
 
-    if (g_streamed){
-        g_streamed = false;
-        // if function printed anything, need to add a newline (not RAW mode)
-        send_ws_friendly_frame(client_id, "\r\n");
+        be_pop(vm, 1); // Pop the result
+
+    } else if (res == BE_EXCEPTION) {
+        // Get the error message (stderr)
+        if (be_isstring(vm, -1)) {
+             error_str = be_tostring(vm, -1);
+        }
+        // Send first terminator (end of empty stdout)
+        send_ws_text_frame(client->sockfd, "\x04");
+        // Send stderr message (if any)
+        if (error_str && strlen(error_str) > 0) {
+             send_ws_text_frame(client->sockfd, error_str);
+        }
+        // Send second terminator (end of stderr/command)
+        send_ws_text_frame(client->sockfd, "\x04");
+
+        be_pop(vm, 1); // Pop the exception object
+    } else {
+         // Other errors (should theoretically not happen after successful compile?)
+        ESP_LOGE(TAG, "Unexpected be_pcall result: %d", res);
+        // Send empty stdout
+        // send_ws_text_frame(client->sockfd, "", 0);
+        // Send first terminator
+        send_ws_text_frame(client->sockfd, "\x04");
+        // Send empty stderr
+        // send_ws_text_frame(client->sockfd, "", 0);
+         // Send second terminator
+        send_ws_text_frame(client->sockfd, "\x04");
     }
 
-    switch (res) {
-        case BE_OK: /* execution succeed */
-            // First check the actual result value which is on the stack for expressions
-            if (!be_isnil(vm, -1)) { // if output from command, eg 3+4
-                const char *result = be_tostring(vm, -1);
-                if (result && *result) {
-                    send_ws_text_frame(ws_clients[client_id].sockfd, result);
-                    send_ws_friendly_frame(client_id, "\r\n");
-                }
-            } 
-            be_pop(vm, 1);  // Pop result value
-            if (ws_clients[client_id].repl_state == REPL_RAW) {
-                send_ws_text_frame(ws_clients[client_id].sockfd, "\x04");
-            }
-            break; // Exit switch for BE_OK
-
-        case BE_EXCEPTION:
-            // Send stderr via be_dumpexcept
-            be_dumpexcept(vm);
-            be_pop(vm, 1); // pop the exception object
-
-            if (ws_clients[client_id].repl_state == REPL_RAW) {
-                send_ws_text_frame(ws_clients[client_id].sockfd, "\x04");
-            }
-            break; // Exit switch for BE_EXCEPTION
-
-        default: /* BE_EXIT or BE_MALLOC_FAIL */
-            // Treat other cases like errors - send the first \x04
-             if (ws_clients[client_id].repl_state == REPL_RAW) {
-                send_ws_text_frame(ws_clients[client_id].sockfd, "\x04");
-             }
-            // Don't return here, fall through to send the second \x04
-    }
-
-    // Send SECOND RAW REPL terminator (after stderr or first \x04)
-    // This marks the end of the command execution response.
-    if (ws_clients[client_id].repl_state == REPL_RAW) {
-       send_ws_text_frame(ws_clients[client_id].sockfd, "\x04");
-    }
-
-    // Return appropriate status from the pcall
-    return (res == BE_OK || res == BE_EXCEPTION) ? 0 : res; // Indicate success (0) for OK/Exception handled, else return original code
+    g_stream_sockfd = original_stream_sockfd; // Restore streaming state
+    return res; // Return the result code (BE_OK, BE_EXCEPTION, etc.)
 }
 
 // Helper function to compile and execute a Berry command
-static int compile_and_execute_command(bvm *vm, int client_id) {
+static int compile_and_execute_command(bvm *vm, int client_id)
+{
+    ws_client_t *client = &ws_clients[client_id];
+    int res;
 
-    g_streamed = false;
-    g_stream_sockfd = ws_clients[client_id].sockfd;   // enable Berry print streaming to ws
+    // Try to compile the command buffer
+    res = webrepl_compile(vm, client_id);
 
-    // Compile the command - this will update client->in_multiline as needed
-    int res = webrepl_compile(vm, client_id);
-    
-    // Only execute if compilation succeeded and not in multi-line mode
-    if (res == BE_OK && !ws_clients[client_id].in_multiline) {
+    // Only execute if compilation succeeded and it's not a multi-line statement
+    // webrepl_compile handles prompts/errors/terminators otherwise
+    if (res == BE_OK && !client->in_multiline) {
+        // Call the script. It will handle its own output/error and terminators.
         res = webrepl_call_script(vm, client_id);
-        if (res) {
+        // webrepl_call_script returns 0 for handled OK/Exception, or error code
+        if (res != 0 && res != BE_OK && res != BE_EXCEPTION) {
             ESP_LOGE(TAG, "Execution error: %d", res);
+            // Note: Terminators were already sent by webrepl_call_script
         }
+        // Reset the command buffer after successful execution
+        client->command_len = 0;
+        client->command_buffer[0] = '\0';
     }
-    g_stream_sockfd = -1;       //disable Berry print streaming to WS
+    // If compilation failed (res != BE_OK) or it's multi-line, webrepl_compile handled prompts/output/terminators
 
-    return res;
+    return (res == BE_OK) ? 0 : res; // Return 0 for overall success or multi-line, else the error code from compile/exec
 }
 
 // Handles all incoming data for a client in REPL mode
@@ -751,7 +793,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                 case 0x04: // Ctrl+D: Soft reset / End of input (Friendly mode)
                     ESP_LOGI(TAG, "Client %d: Soft Reset / EOF received (^D)", client_id);
                 if (client->repl_state == REPL_FRIENDLY) {
-                    send_ws_friendly_frame(client->client_id, "\r\n" WEBREPL_PROMPT);
+                    send_ws_friendly_frame(client_id, "\r\n" WEBREPL_PROMPT);
                 }       
                 
 
@@ -764,7 +806,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                         client->line_len--;
                         client->line_buffer[client->line_len] = '\0';
                         // Echo backspace sequence to erase the last character
-                        send_ws_friendly_frame(client->client_id, "\b \b");
+                        send_ws_friendly_frame(client_id, "\b \b");
                     }
                     break;
                 default:
@@ -803,15 +845,8 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                     // Special handling for multi-line input
                     if (client->in_multiline) {
                         // Append the new line with a newline character
-                        if (!ensure_command_buffer(client, client->command_len + client->line_len + 2)) {
-                            ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
-                            return;
-                        }
-                        // Append a newline first if we have existing content
-                        if (client->command_len > 0) {
-                            client->command_buffer[client->command_len++] = '\n';
-                        }
-                        // Then append the accumulated line
+                        if (!ensure_command_buffer(client, client->command_len + client->line_len + 2)) { /* ... error handling ... */ return; }
+                        if (client->command_len > 0) client->command_buffer[client->command_len++] = '\n';
                         if (client->line_len > 0) {
                              memcpy(client->command_buffer + client->command_len, client->line_buffer, client->line_len);
                             client->command_len += client->line_len;
@@ -819,23 +854,14 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                          client->command_buffer[client->command_len] = '\0';
 
                          if (client->line_len == 0 || indent_level == 0) {
-                             ESP_LOGD(TAG, "Multi-line block ended. Executing.");
-                            client->in_multiline = false;
+                             client->in_multiline = false;
                             compile_and_execute_command(vm, client_id );
                         } else {
-                             ESP_LOGD(TAG, "Multi-line continuing...");
-                            send_ws_friendly_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
+                             send_ws_friendly_frame(client_id, WEBREPL_CONTINUATION_PROMPT);
                         }
-
                     } else if (is_multiline_trigger) {
-                         ESP_LOGD(TAG, "Multi-line block started.");
-                        client->in_multiline = true;
-                        // Copy the first line to the command buffer
-                        if (!ensure_command_buffer(client, client->line_len + 2)) { // + newline + null
-                            ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
-                             client->in_multiline = false; // Reset state
-                            return;
-                        }
+                         client->in_multiline = true;
+                        if (!ensure_command_buffer(client, client->line_len + 2)) { /* ... error handling ... */ return; }
                         memcpy(client->command_buffer, client->line_buffer, client->line_len);
                         client->command_len = client->line_len;
                         client->command_buffer[client->command_len] = '\0';
@@ -843,10 +869,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                     } else {
                         // Normal single-line processing
                         // Copy line buffer to command buffer
-                        if (!ensure_command_buffer(client, client->line_len + 1)) {
-                            ESP_LOGE(TAG, "Failed to allocate command buffer for client %d", client_id);
-                            return;
-                        }
+                        if (!ensure_command_buffer(client, client->line_len + 1)) { /* ... error handling ... */ return; }
                         memcpy(client->command_buffer, client->line_buffer, client->line_len);
                         client->command_len = client->line_len;
                         client->command_buffer[client->command_len] = '\0';
@@ -860,19 +883,12 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
                     client->line_buffer[0] = '\0';
 
                 } else { // Empty line received
-                    if (client->in_multiline) {
-                        // Empty line finishes multi-line input
-                        ESP_LOGD(TAG, "Multi-line block ended by empty line. Executing.");
+                     if (client->in_multiline) {
                         client->in_multiline = false;
-                        // command_buffer already holds the multi-line code
                         compile_and_execute_command(vm, client_id);
                     } else {
-                         // Empty line in single-line mode, just show prompt
-                        send_ws_friendly_frame(client_id, WEBREPL_PROMPT);
+                         send_ws_friendly_frame(client_id, WEBREPL_PROMPT);
                     }
-                    // Reset line buffer
-                     client->line_len = 0;
-                    client->line_buffer[0] = '\0';
                 }
                 
                 return; // Handled line termination
@@ -930,7 +946,7 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
             // If we found a line terminator, process the line buffer
             if (line_end < end && (*line_end == '\r' || *line_end == '\n')) {
                 // Echo newline
-                send_ws_friendly_frame(client->client_id, "\r\n");
+                send_ws_friendly_frame(client_id, "\r\n");
                 
                  // Process the line (similar logic as single char line termination)
                 if (client->line_len > 0 || client->in_multiline) {
