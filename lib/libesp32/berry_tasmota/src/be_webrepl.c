@@ -323,7 +323,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
             if (op_state->data_bytes_received + bytes_to_write > op_state->data_bytes_expected) {
                  ESP_LOGW(TAG, "Client %d PUT: Received more data (%d) than expected (%u). Truncating.",
                           client_id, (int)bytes_to_write, op_state->data_bytes_expected - op_state->data_bytes_received);
-                 bytes_to_write = op_state->data_bytes_expected - op_state->data_bytes_received;
+                 bytes_to_write = op_state->data_bytes_received - op_state->data_bytes_expected;
             }
 
             if (bytes_to_write > 0) {
@@ -571,11 +571,9 @@ static int webrepl_compile(bvm *vm, int client_id) {
 
     // Expression evaluation succeeded or non-syntax error occurred
     if (res == BE_OK) {
-        // Reset buffer and multi-line state
-        client->command_len = 0;
-        client->command_buffer[0] = '\0';
-        client->in_multiline = false;
-
+        // If compilation succeeded, we don't print anything yet.
+        // The compiled closure is on the stack, ready for execution.
+        // The actual execution happens in the be_pcall block below.
     } else {
         // Non-syntax error (e.g., from try_return)
         // Temporarily disable streaming for error output
@@ -604,64 +602,55 @@ static int webrepl_compile(bvm *vm, int client_id) {
         client->in_multiline = false;
     }
 
-    return res;
+    return (res == BE_OK) ? 0 : res; // Return 0 for overall success or multi-line, else the error code from compile/exec
 }
 
 // Call the compiled script if it's on top of the stack
 static int webrepl_call_script(bvm *vm, int client_id) {
-    int original_stream_sockfd = g_stream_sockfd;
-    g_stream_sockfd = -1; // Disable streaming during sync output
-    const char* output_str = NULL;
-    const char* error_str = NULL;
     ws_client_t *client = &ws_clients[client_id];
-    int res = be_pcall(vm, 0);
+    int res;
 
-    if (res == BE_OK) {
-        // Check if there is a return value (stdout)
+    // Store current stream sockfd, set it for this client during execution, then restore
+    int original_stream_sockfd = g_stream_sockfd;
+    g_stream_sockfd = client->sockfd; // Redirect VM output to this client's socket
+
+    res = be_pcall(vm, 0);
+
+    // If a runtime exception occurred, format and print it via the VM's output handler
+    if (res == BE_EXCEPTION) {
+        be_dumpexcept(vm); // Dumps the exception traceback using the configured output func
+        // Exception object is still on the stack after dumping
+        if (!be_isnil(vm, -1)) { // Make sure something is on the stack before popping
+            be_pop(vm, 1); // Pop the exception object
+        }
+    } else if (res == BE_OK) {
+        // If successful, check the result value
+        // Note: Actual output from print() or expression eval was already streamed by the output handler
         if (!be_isnil(vm, -1)) {
-            output_str = be_tostring(vm, -1);
+            // Result is not nil, implicitly print it via the VM's output function
+            const char* result_str = be_tostring(vm, -1); // Get string representation
+            if (result_str) { // Check if conversion was successful
+                 be_writestring(result_str); // Call the Berry API macro to write the string
+                 be_writenewline();      // Call the Berry API macro to write a newline
+            }
+            be_pop(vm, 1); // Pop the result value
         }
-        // Send stdout (if any)
-        if (output_str && strlen(output_str) > 0) {
-             send_ws_text_frame(client->sockfd, output_str);
-        }
-        // Send first terminator (end of stdout)
-        send_ws_text_frame(client->sockfd, "\x04");
-        // Send second terminator (end of empty stderr/command)
-        send_ws_text_frame(client->sockfd, "\x04");
-
-        be_pop(vm, 1); // Pop the result
-
-    } else if (res == BE_EXCEPTION) {
-        // Get the error message (stderr)
-        if (be_isstring(vm, -1)) {
-             error_str = be_tostring(vm, -1);
-        }
-        // Send first terminator (end of empty stdout)
-        send_ws_text_frame(client->sockfd, "\x04");
-        // Send stderr message (if any)
-        if (error_str && strlen(error_str) > 0) {
-             send_ws_text_frame(client->sockfd, error_str);
-        }
-        // Send second terminator (end of stderr/command)
-        send_ws_text_frame(client->sockfd, "\x04");
-
-        be_pop(vm, 1); // Pop the exception object
+        // If result was nil, do nothing (don't print nil)
     } else {
-         // Other errors (should theoretically not happen after successful compile?)
-        ESP_LOGE(TAG, "Unexpected be_pcall result: %d", res);
-        // Send empty stdout
-        // send_ws_text_frame(client->sockfd, "", 0);
-        // Send first terminator
-        send_ws_text_frame(client->sockfd, "\x04");
-        // Send empty stderr
-        // send_ws_text_frame(client->sockfd, "", 0);
-         // Send second terminator
-        send_ws_text_frame(client->sockfd, "\x04");
+        // Other errors?
+        ESP_LOGE(TAG, "Unexpected be_pcall result in webrepl_call_script: %d", res);
+        // Potentially pop something here too? Need to know what state be_pcall leaves.
     }
 
-    g_stream_sockfd = original_stream_sockfd; // Restore streaming state
-    return res; // Return the result code (BE_OK, BE_EXCEPTION, etc.)
+    g_stream_sockfd = original_stream_sockfd; // Restore original stream redirection
+
+    // Always send the terminators after execution/exception handling
+    // Send first terminator (end of stdout/stderr stream)
+    send_ws_text_frame(client->sockfd, "\x04");
+    // Send second terminator (end of command)
+    send_ws_text_frame(client->sockfd, "\x04");
+
+    return res; // Return the original result code
 }
 
 // Helper function to compile and execute a Berry command
@@ -686,8 +675,10 @@ static int compile_and_execute_command(bvm *vm, int client_id)
         // Reset the command buffer after successful execution
         client->command_len = 0;
         client->command_buffer[0] = '\0';
+
+    } else { // Compilation failed or multi-line
+        // webrepl_compile handled prompts/output/terminators
     }
-    // If compilation failed (res != BE_OK) or it's multi-line, webrepl_compile handled prompts/output/terminators
 
     return (res == BE_OK) ? 0 : res; // Return 0 for overall success or multi-line, else the error code from compile/exec
 }
@@ -1019,6 +1010,15 @@ void be_webrepl_handle_input(bvm *vm, int client_id, const char* data, size_t le
             be_pop(vm, be_top(vm) - initial_top);  // Restore stack balance
         }
     } // End else (Friendly REPL Mode)
+}
+
+static void webrepl_log_output_handler(const char* output) {
+    if (g_stream_sockfd >= 0) {
+        ESP_LOGI(TAG, "webrepl_log_output_handler: Sending to sockfd %d: '%s'", g_stream_sockfd, output ? output : "(null)"); // Log handler activity
+        send_ws_text_frame(g_stream_sockfd, output);
+    } else {
+        // ESP_LOGD(TAG, "webrepl_log_output_handler: Stream sockfd not set, discarding: %s", output); // Optional: Log discarded output
+    }
 }
 
 #endif // USE_BERRY_WEBREPL
