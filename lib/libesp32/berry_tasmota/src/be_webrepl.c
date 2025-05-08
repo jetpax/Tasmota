@@ -109,11 +109,11 @@ static bool webrepl_send_file_chunk(int client_id) {
 
      int sockfd = ws_clients[client_id].sockfd;
      FILE *fp = op_state->fp;
-     uint8_t chunk_buf[256 + 2]; // Max chunk size + 2 bytes length prefix
+     uint8_t chunk_buf[1024 + 2]; // Increased to 1KB chunk size + 2 bytes length prefix
      size_t bytes_read;
 
      // Protect against reading past intended size if specified (though GET usually doesn't specify size)
-     uint32_t max_read = 256;
+     uint32_t max_read = 1024;    // Increased to 1KB
      // if (op_state->hdr.size > 0 && op_state->data_bytes_received + max_read > op_state->hdr.size) {
      //     max_read = op_state->hdr.size - op_state->data_bytes_received;
      // }
@@ -174,19 +174,39 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
     webrepl_binop_state_t *op_state = &ws_clients[client_id].binop;
 
     // <<< MODIFIED: Handle GET confirmations - check for specific 0x00 byte >>>
+    // --- Handle GET_FILE data streaming ---
     if (op_state->active && op_state->hdr.op == WEBREPL_OP_GET_FILE && op_state->fp != NULL) {
-        // Check if the received packet is exactly the 1-byte confirmation (0x00)
-        if (len == 1 && data[0] == 0x00) { 
-            ESP_LOGD(TAG,"Client %d GET: Received confirmation byte 0x00, sending next chunk.", client_id);
-            if (!webrepl_send_file_chunk(client_id)) {
-                // File send finished or failed, state already cleaned up by helper
-                ESP_LOGD(TAG,"Client %d GET: Send finished/failed after confirmation.", client_id);
+        // This block is entered when the client sends the *initial* 0x00 confirmation
+        // after the server has sent its first "WB OK" for the GET request.
+        if (len == 1 && data[0] == 0x00 && !op_state->get_streaming_started) { // Check a new flag
+            ESP_LOGI(TAG,"Client %d GET: Received initial 0x00 confirmation. Starting file stream for '%s'.", client_id, op_state->filename);
+            op_state->get_streaming_started = true; // Mark that streaming has begun
+
+            // Loop to send all file chunks
+            bool send_success = true;
+            while (send_success) {
+                send_success = webrepl_send_file_chunk(client_id);
+                if (!send_success) {
+                    // webrepl_send_file_chunk handles fclose, final WB OK/ERROR, and op_state->active = false
+                    ESP_LOGI(TAG,"Client %d GET: Finished streaming or error occurred for '%s'.", client_id, op_state->filename);
+                    break; // Exit loop, operation is complete or failed
+                }
+                // Optional: Small yield if necessary for very large files and slow clients.
+                // if (op_state->active) { // Only delay if op is still active (not finished by last send_file_chunk)
+                //    vTaskDelay(pdMS_TO_TICKS(1)); // Minimal delay to allow other tasks, esp. network stack
+                // }
             }
+        } else if (op_state->get_streaming_started) {
+            // If streaming has started, we don't expect any more binary data from the client for this GET op
+            // until the server has signaled completion (which it does via webrepl_send_file_chunk sending a final WB response).
+            ESP_LOGW(TAG,"Client %d GET: Received unexpected binary data (len %d) while streaming '%s'. Ignoring.",
+                     client_id, (int)len, op_state->filename);
         } else {
-             ESP_LOGW(TAG,"Client %d GET: Received unexpected binary data (len %d, data[0]=0x%02x) during active GET. Ignoring.", 
-                      client_id, (int)len, (len > 0 ? data[0] : 0xFF));
+            // Initial 0x00 not yet received, or unexpected data before it.
+             ESP_LOGW(TAG,"Client %d GET: Waiting for initial 0x00 or received unexpected binary before it (len %d, data[0]=0x%02x) for '%s'. Ignoring.",
+                      client_id, (int)len, (len > 0 ? data[0] : 0xFF), op_state->filename);
         }
-        return; // Done handling this packet (either confirmation or unexpected data)
+        return; // Done handling this packet for GET_FILE
     }
     // <<< END MODIFICATION >>>
 
@@ -206,6 +226,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
         op_state->data_bytes_received = 0;
         op_state->data_bytes_expected = 0; // Set later
         op_state->fp = NULL;
+        op_state->get_streaming_started = false; // <<< INITIALIZE NEW FLAG
         ESP_LOGD(TAG,"Binary Handle: Client %d starting new binary op.", client_id);
     }
 

@@ -19,7 +19,7 @@
 // --- Binary Protocol definitions ---
 // Mirroring MicroPython's WebREPL binary protocol header
 typedef struct __attribute__((packed)) { // Use packed to match potential uPy layout
-    char sig[2];        // Should be 'W', 'A'
+    char sig[2];        // Should be 'W', 'B'
     uint8_t op;         // 1=PUT_FILE, 2=GET_FILE
     uint8_t flags;      // Currently unused?
     uint64_t offset;    // File offset for PUT/GET (Little Endian)
@@ -28,7 +28,7 @@ typedef struct __attribute__((packed)) { // Use packed to match potential uPy la
     // Filename follows immediately
 } webrepl_binhdr_t;
 
-#define WEBREPL_HDR_SIG "WA"
+#define WEBREPL_HDR_SIG "WB"
 #define WEBREPL_OP_PUT_FILE 1
 #define WEBREPL_OP_GET_FILE 2
 #define WEBREPL_RESP_OK 0
@@ -43,6 +43,7 @@ typedef struct {
     uint32_t data_bytes_received;
     FILE *fp;
     char filename[128]; // Max filename length + safety margin
+    bool get_streaming_started; // True if initial 0x00 for GET received and server is streaming
 } webrepl_binop_state_t;
 
 // --- Client Tracking Structure (Shared) ---
