@@ -20,7 +20,7 @@
 #ifdef USE_BERRY_WSSERVER
 
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
 #endif
 
 
@@ -392,7 +392,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         if ((ws_pkt.len == 1) && (text_payload[0]  < 0x20 || text_payload[0]  == 0x7F)) {
             ESP_LOGD(TAG, "Client %d (State:%d) Received CTRL char '[0x%02X]'", client_slot, ws_clients[client_slot].repl_state, text_payload[0] );
         } else {
-            ESP_LOGI(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].repl_state, ws_pkt.len, text_payload ? text_payload : "");
+            ESP_LOGD(TAG, "Client %d (State:%d) Received TEXT (len %d): '%s'", client_slot, ws_clients[client_slot].repl_state, ws_pkt.len, text_payload ? text_payload : "");
         }                
         // Queue the message - httpserver_queue_message will make its own copy
         if (!httpserver_queue_message(HTTP_MSG_WEBSOCKET, client_slot, text_payload, ws_pkt.len, NULL)) {

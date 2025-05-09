@@ -20,7 +20,7 @@
 #ifdef USE_BERRY_WEBREPL
 
 #ifndef LOG_LOCAL_LEVEL
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
 #endif
 
 #include <string.h>
