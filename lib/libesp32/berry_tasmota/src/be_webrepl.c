@@ -109,11 +109,11 @@ static bool webrepl_send_file_chunk(int client_id) {
 
      int sockfd = ws_clients[client_id].sockfd;
      FILE *fp = op_state->fp;
-     uint8_t chunk_buf[1024 + 2]; // Increased to 1KB chunk size + 2 bytes length prefix
+     uint8_t chunk_buf[4096 + 2]; // 4K chunk size + 2 bytes length prefix
      size_t bytes_read;
 
      // Protect against reading past intended size if specified (though GET usually doesn't specify size)
-     uint32_t max_read = 1024;    // Increased to 1KB
+     uint32_t max_read = 4096;    
      // if (op_state->hdr.size > 0 && op_state->data_bytes_received + max_read > op_state->hdr.size) {
      //     max_read = op_state->hdr.size - op_state->data_bytes_received;
      // }
@@ -188,7 +188,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
                 send_success = webrepl_send_file_chunk(client_id);
                 if (!send_success) {
                     // webrepl_send_file_chunk handles fclose, final WB OK/ERROR, and op_state->active = false
-                    ESP_LOGI(TAG,"Client %d GET: Finished streaming or error occurred for '%s'.", client_id, op_state->filename);
+                    ESP_LOGI(TAG,"Client %d GET: Finished streaming'%s'.", client_id, op_state->filename);
                     break; // Exit loop, operation is complete or failed
                 }
                 // Optional: Small yield if necessary for very large files and slow clients.

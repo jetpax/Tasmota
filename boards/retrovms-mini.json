@@ -30,7 +30,7 @@
     ],
     "mcu": "esp32s3",
     "variant": "esp32s3",
-    "partitions": "partitions/esp32_partition_app3904k_fs3392k.csv"
+    "partitions": "partitions/esp32_partition_app3904k_fs11M.csv"
   },
   "connectivity": [
     "bluetooth",
