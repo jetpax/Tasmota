@@ -426,8 +426,8 @@ static int w_httpserver_process_queue(bvm *vm) {
     // Count of messages processed in this call
     int processed = 0;
     
-    // Process up to 5 messages in a single call to avoid blocking
-    for (int i = 0; i < 5; i++) {
+    // Process up to 10 messages in a single call to avoid blocking
+    for (int i = 0; i < 10; i++) {
         // Take mutex before accessing queue
         if (xSemaphoreTake(http_queue_mutex, 0) != pdTRUE) {
             ESP_LOGW(TAG, "Failed to take mutex, will retry");
@@ -616,7 +616,7 @@ static int w_httpserver_start(bvm *vm) {
     
     // Initialize the queue for thread-safe message passing
     if (!http_queue_initialized) {
-        http_msg_queue = xQueueCreate(10, sizeof(http_queue_msg_t));
+        http_msg_queue = xQueueCreate(50, sizeof(http_queue_msg_t));
         http_queue_mutex = xSemaphoreCreateMutex();
         
         if (http_msg_queue != NULL && http_queue_mutex != NULL) {

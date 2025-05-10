@@ -344,7 +344,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
             if (op_state->data_bytes_received + bytes_to_write > op_state->data_bytes_expected) {
                  ESP_LOGW(TAG, "Client %d PUT: Received more data (%d) than expected (%u). Truncating.",
                           client_id, (int)bytes_to_write, op_state->data_bytes_expected - op_state->data_bytes_received);
-                 bytes_to_write = op_state->data_bytes_received - op_state->data_bytes_expected;
+                 bytes_to_write = op_state->data_bytes_expected - op_state->data_bytes_received;
             }
 
             if (bytes_to_write > 0) {
@@ -370,8 +370,15 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
                      client_id, op_state->filename, op_state->data_bytes_received);
             fclose(op_state->fp);
             op_state->fp = NULL;
+            
+            // Ensure file sync by closing it properly before sending final OK
+            ESP_LOGI(TAG, "Client %d PUT: File closed successfully. Sending final OK.", client_id);
+            
             webrepl_send_bin_resp(client_id, WEBREPL_RESP_OK); // Final OK
             op_state->active = false; // Operation finished
+            
+            // Add delay to ensure final OK has time to be transmitted
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 
