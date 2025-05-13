@@ -3,6 +3,11 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#ifndef LOG_LOCAL_LEVEL
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -22,7 +27,7 @@
 #include "esp_modem_dce_common_commands.h"
 #include "usbh_modem_board.h"
 
-static const char *TAG = "modem_board";
+static const char *TAG = "MDM_BOARD";
 ESP_EVENT_DEFINE_BASE(MODEM_BOARD_EVENT);
 
 #define MODEM_CHECK_GOTO(a, str, goto_tag, ...)                                       \
@@ -36,8 +41,8 @@ ESP_EVENT_DEFINE_BASE(MODEM_BOARD_EVENT);
         if (!(a))                                                                     \
         {                                                                             \
             ESP_LOGE(TAG, "%s(%d): " str, __FUNCTION__, __LINE__, ##__VA_ARGS__);     \
-            return return_tag;                                                            \
-        }                                                                             \
+            return return_tag;                                                        \  
+        }                                                                             
 
 #define MODEM_POWER_GPIO                    CONFIG_MODEM_POWER_GPIO
 #define MODEM_RESET_GPIO                    CONFIG_MODEM_RESET_GPIO
@@ -402,18 +407,21 @@ static bool _ppp_network_stop(esp_modem_dte_t *dte)
 
 static void _modem_daemon_task(void *param)
 {
-    modem_config_t *config = (modem_config_t *)param;
+    // Immediately copy the config data before the original pointer becomes invalid
+    modem_config_t local_config = *(modem_config_t *)param;
+    // Now use local_config instead of config pointer
+
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    if ((config->flags & MODEM_FLAGS_INIT_NOT_FORCE_RESET) == 0) {
+    if ((local_config.flags & MODEM_FLAGS_INIT_NOT_FORCE_RESET) == 0) { 
         modem_board_force_reset();
     }
     // init the USB DTE
     esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_CONFIG();
-    dte_config.rx_buffer_size = config->rx_buffer_size; //rx ringbuffer for usb transfer
-    dte_config.tx_buffer_size = config->tx_buffer_size; //tx ringbuffer for usb transfer
-    dte_config.line_buffer_size = config->line_buffer_size;
-    dte_config.event_task_stack_size = config->event_task_stack_size; //task to handle usb rx data
-    dte_config.event_task_priority = config->event_task_priority; //task to handle usb rx data
+    dte_config.rx_buffer_size = local_config.rx_buffer_size; 
+    dte_config.tx_buffer_size = local_config.tx_buffer_size; 
+    dte_config.line_buffer_size = local_config.line_buffer_size; 
+    dte_config.event_task_stack_size = local_config.event_task_stack_size; 
+    dte_config.event_task_priority = local_config.event_task_priority; 
     dte_config.conn_callback = _usb_dte_conn_callback;
     dte_config.disconn_callback = _usb_dte_disconn_callback;
     esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(CONFIG_MODEM_PPP_APN);
@@ -422,17 +430,20 @@ static void _modem_daemon_task(void *param)
     // Initialize esp-modem units, DTE, DCE, ppp-netif
     esp_modem_dte_t *dte = esp_modem_dte_new(&dte_config);
     assert(dte != NULL);
+
     esp_modem_dce_t *dce = modem_board_create(&dce_config);
     assert(dce != NULL);
+
     esp_netif_t *ppp_netif = esp_netif_new(&ppp_netif_config);
     assert(ppp_netif != NULL);
+
     /* attach driver to ppp interface, start DTE handling */
     s_dce = dce;
     ESP_ERROR_CHECK(esp_modem_default_attach(dte, dce, ppp_netif));
     ESP_ERROR_CHECK(esp_modem_set_event_handler(dte, on_modem_event, ESP_EVENT_ANY_ID, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, on_modem_event, NULL));
-    if (config->handler) {
-        ESP_ERROR_CHECK(esp_event_handler_register(MODEM_BOARD_EVENT, ESP_EVENT_ANY_ID, config->handler, config->handler_arg));
+    if (local_config.handler) { 
+        ESP_ERROR_CHECK(esp_event_handler_register(MODEM_BOARD_EVENT, ESP_EVENT_ANY_ID, local_config.handler, local_config.handler_arg)); 
     }
     int stage_retry_times = 0;
     int retry_after_ms = 0;
@@ -645,8 +656,8 @@ _stage_succeed:
         }
     }
 
-    if (config->handler) {
-        esp_event_handler_unregister(MODEM_BOARD_EVENT, ESP_EVENT_ANY_ID, config->handler);
+    if (local_config.handler) {
+        esp_event_handler_unregister(MODEM_BOARD_EVENT, ESP_EVENT_ANY_ID, local_config.handler);
     }
     ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, on_modem_event));
     // destroy dte & dce

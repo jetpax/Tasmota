@@ -41,6 +41,11 @@
 // Arduino.h might not be needed if power/reset is handled by iot_usbh_modem Kconfigs
 // #include "Arduino.h"
 
+// Define CONFIG_USBH_TASK_BASE_PRIORITY if not already defined
+#ifndef CONFIG_USBH_TASK_BASE_PRIORITY
+#define CONFIG_USBH_TASK_BASE_PRIORITY 5
+#endif
+
 static const char* TAG = "MDM_BE";
 
 // Global state for the new driver
@@ -79,17 +84,39 @@ static int w_modem_send_sms(bvm *vm);
 
 // --- Removed GPIO and old USB init related static functions ---
 
-// Event handler to be passed to modem_board_init if user registers one
+// Event handler to be passed to modem_board_init
 static void modem_event_proxy_handler(void *handler_arg, esp_event_base_t base, int32_t id, void *event_data) {
-    // This is called by the modem_board component's event loop.
-    // We need to call the user's Berry function.
-    // This requires careful handling of VM state and is more complex.
-    // For now, let's keep it simple or defer full Berry callback integration.
     ESP_LOGI(TAG, "Modem Board Event: Base=%s, ID=%d", base, (int)id);
-
-    if (g_user_event_handler) { // This is a C callback, not a Berry function directly yet
-      // To call a Berry function, we'd need to get the VM, push args, pcall.
-      // For now, just logging.
+    
+    if (base == MODEM_BOARD_EVENT) {
+        if (id == MODEM_EVENT_SIMCARD_DISCONN) {
+            ESP_LOGW(TAG, "Modem Board Event: SIM Card disconnected");
+        } else if (id == MODEM_EVENT_SIMCARD_CONN) {
+            ESP_LOGI(TAG, "Modem Board Event: SIM Card Connected");
+        } else if (id == MODEM_EVENT_DTE_DISCONN) {
+            ESP_LOGW(TAG, "Modem Board Event: USB disconnected");
+        } else if (id == MODEM_EVENT_DTE_CONN) {
+            ESP_LOGI(TAG, "Modem Board Event: USB connected");
+        } else if (id == MODEM_EVENT_DTE_RESTART) {
+            ESP_LOGW(TAG, "Modem Board Event: Hardware restart");
+        } else if (id == MODEM_EVENT_DTE_RESTART_DONE) {
+            ESP_LOGI(TAG, "Modem Board Event: Hardware restart done");
+        } else if (id == MODEM_EVENT_NET_CONN) {
+            ESP_LOGI(TAG, "Modem Board Event: Network connected");
+        } else if (id == MODEM_EVENT_NET_DISCONN) {
+            ESP_LOGW(TAG, "Modem Board Event: Network disconnected");
+        } else if (id == MODEM_EVENT_WIFI_STA_CONN) {
+            ESP_LOGI(TAG, "Modem Board Event: Station connected");
+        } else if (id == MODEM_EVENT_WIFI_STA_DISCONN) {
+            ESP_LOGW(TAG, "Modem Board Event: All stations disconnected");
+        } else {
+            ESP_LOGI(TAG, "Modem Board Event: Unknown event ID=%d", (int)id);
+        }
+    }
+    
+    // Future enhancement: call Berry callback if registered
+    if (g_user_event_handler) {
+        // To be implemented with proper Berry VM stack management
     }
 }
 
@@ -110,10 +137,9 @@ static int w_modem_init(bvm *vm) { // Replaces w_modem_setup_environment
     // Don't block init waiting for IP
     modem_config.flags |= MODEM_FLAGS_INIT_NOT_BLOCK;
 
-    // TODO: Expose event handler registration to Berry if needed
-    // For now, we can use a simple C proxy if a C callback is registered from Berry later.
-    // modem_config.handler = modem_event_proxy_handler;
-    // modem_config.handler_arg = NULL; // Or pass some context
+    // Register our event handler to process modem events
+    modem_config.handler = modem_event_proxy_handler;
+    modem_config.handler_arg = NULL; // No context needed for now
 
     esp_err_t err = modem_board_init(&modem_config);
     if (err == ESP_OK) {

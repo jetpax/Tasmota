@@ -3,6 +3,11 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#ifndef LOG_LOCAL_LEVEL
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
@@ -16,6 +21,7 @@
 #include "esp_modem_internal.h"
 #include "esp_modem_dte_internal.h"
 #include "iot_usbh_cdc.h"
+#include "esp_heap_caps.h"
 
 #define ESP_MODEM_EVENT_QUEUE_SIZE (16)
 
@@ -436,14 +442,14 @@ esp_modem_dte_t *esp_modem_dte_new(const esp_modem_dte_config_t *config)
 {
     esp_err_t ret;
     /* malloc memory for esp_dte object */
-    esp_modem_dte_internal_t *esp_dte = calloc(1, sizeof(esp_modem_dte_internal_t));
+    esp_modem_dte_internal_t *esp_dte = heap_caps_calloc(1, sizeof(esp_modem_dte_internal_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); 
     ESP_MODEM_ERR_CHECK(esp_dte, "calloc esp_dte failed", err_dte_mem);
     /* malloc memory to storing lines from modem dce */
     esp_dte->line_buffer_size = config->line_buffer_size;
-    esp_dte->buffer = calloc(1, config->line_buffer_size);
+    esp_dte->buffer = heap_caps_calloc(1, config->line_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_MODEM_ERR_CHECK(esp_dte->buffer, "calloc line memory failed", err_buf_mem);
-    esp_dte->data_buffer_size = config->line_buffer_size;
-    esp_dte->data_buffer = calloc(1, esp_dte->data_buffer_size);
+    esp_dte->data_buffer_size = config->line_buffer_size; 
+    esp_dte->data_buffer = heap_caps_calloc(1, esp_dte->data_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_MODEM_ERR_CHECK(esp_dte->data_buffer, "calloc data memory failed", err_buf_mem);
     esp_dte->parent.send_cmd_lock = xSemaphoreCreateMutex();
     ESP_MODEM_ERR_CHECK(esp_dte->parent.send_cmd_lock, "create send cmd lock failed", err_buf_mem);
