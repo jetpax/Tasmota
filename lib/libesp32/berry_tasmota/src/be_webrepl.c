@@ -173,7 +173,7 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
 
     webrepl_binop_state_t *op_state = &ws_clients[client_id].binop;
 
-    // <<< MODIFIED: Handle GET confirmations - check for specific 0x00 byte >>>
+    // Handle GET confirmations - check for specific 0x00 byte >>>
     // --- Handle GET_FILE data streaming ---
     if (op_state->active && op_state->hdr.op == WEBREPL_OP_GET_FILE && op_state->fp != NULL) {
         // This block is entered when the client sends the *initial* 0x00 confirmation
@@ -208,7 +208,6 @@ void be_webrepl_handle_binary(bvm *vm, int client_id, const uint8_t* data, size_
         }
         return; // Done handling this packet for GET_FILE
     }
-    // <<< END MODIFICATION >>>
 
     const uint8_t* p_data = data;
     size_t remaining_len = len;

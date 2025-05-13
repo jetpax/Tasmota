@@ -1,0 +1,28 @@
+{
+    "name": "iot_usbh_cdc",
+    "version": "1.0.0",
+    "description": "ESP-IDF USB Host CDC Driver",
+    "keywords": "esp32, usb, cdc",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/espressif/esp-iot-solution"
+    },
+    "authors": [
+        {
+            "name": "Espressif Systems",
+            "email": "info@espressif.com"
+        }
+    ],
+    "platforms": ["espressif32"],
+    "frameworks": ["arduino", "espidf"],
+    "srcFilter": [
+        "-<test_apps/*>"
+      ],
+    "build": {
+        "includeDir": "include",
+        "srcDir": ".",
+        "flags": [
+            "-Iprivate_include"
+        ]
+    }
+}

@@ -1,5 +1,26 @@
-// be_modem_lib.c - Berry module for esp_modem PPPoS over USB
-// Scaffolding for initial connect functionality
+/*
+  be_modem_lib.c - Berry module for esp_modem PPPoS over USB
+  
+  Copyright (C) 2025  Jonathan E. Peace
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#ifndef LOG_LOCAL_LEVEL
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#endif
+
 #include "be_constobj.h"
 #include "be_mapping.h"
 #include "be_vm.h"
@@ -12,769 +33,268 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+// Required for the new iot_usbh_modem component
+#include "usbh_modem_board.h"
+// We might still need esp_netif for checking IP, but let's see
+// #include "esp_netif.h" 
 
-#include "esp_modem_c_api_types.h"
+// Arduino.h might not be needed if power/reset is handled by iot_usbh_modem Kconfigs
+// #include "Arduino.h"
 
-// Include Arduino.h for GPIO operations 
-#include "Arduino.h"
+static const char* TAG = "MDM_BE";
 
-static const char* TAG = "MODEM_BERRY";
+// Global state for the new driver
+static bool g_modem_board_initialized = false;
+static esp_event_handler_t g_user_event_handler = NULL;
+static void *g_user_event_handler_arg = NULL;
 
-// Define a simple USB configuration structure to match esp_modem_usb_config.h
-struct esp_modem_usb_term_config {
-    uint16_t vid;                // Vendor ID of the USB device
-    uint16_t pid;                // Product ID of the USB device
-    int interface_idx;           // USB Interface index that will be used for primary terminal
-    int secondary_interface_idx; // USB Interface index for secondary terminal (-1 if not used)
-    uint32_t timeout_ms;         // Time for a USB modem to connect to USB host (0 = wait forever)
-    int xCoreID;                 // Core affinity of created tasks
-    bool cdc_compliant;          // Whether to treat the USB device as CDC-compliant
-    bool install_usb_host;       // Whether USB Host driver should be installed
-};
 
-// Define our own macros based on esp_modem_usb_config.h
-#define ESP_MODEM_DEFAULT_USB_CONFIG(_vid, _pid, _intf) {\
-    .vid = _vid,\
-    .pid = _pid,\
-    .interface_idx = _intf,\
-    .secondary_interface_idx = -1,\
-    .timeout_ms = 0,\
-    .xCoreID = 0,\
-    .cdc_compliant = false,\
-    .install_usb_host = true\
-}
-
-#define ESP_MODEM_DTE_DEFAULT_USB_CONFIG(_usb_config) {\
-    .dte_buffer_size = 512,\
-    .task_stack_size = 4096,\
-    .task_priority = 5,\
-    .extension_config = &_usb_config\
-}
-
-// Store modem pin configuration
-static int8_t g_modem_power_pin = -1;
-static int8_t g_modem_reset_pin = -1;
-
-// Global DCE and netif handles
-static esp_modem_dce_t *g_modem_dce = NULL;
-static esp_netif_t *g_modem_netif = NULL;
-
-// Modem type - used to customize AT commands for different modems
+// Modem type - used to customize AT commands for different modems (may still be needed for GNSS/SMS)
 typedef enum {
     MODEM_TYPE_GENERIC = 0,
     MODEM_TYPE_SIM7600,
     MODEM_TYPE_SIM800,
     MODEM_TYPE_BG96
 } modem_type_t;
-
 static modem_type_t g_modem_type = MODEM_TYPE_SIM7600; // Default to SIM7600
 
-// Get AT command for getting GNSS data based on modem type
-static const char* get_gnss_command(void) {
-    switch (g_modem_type) {
-        case MODEM_TYPE_SIM7600:
-            return "AT+CGNSINF\r"; // SIM7600 uses this command
-        case MODEM_TYPE_BG96:
-            return "AT+QGPSLOC=2\r"; // BG96 uses this command format
-        case MODEM_TYPE_SIM800:
-            return "AT+CGPSINF=0\r"; // SIM800 uses this command
-        case MODEM_TYPE_GENERIC:
-        default:
-            return "AT+CGNSINF\r"; // Default to SIM7600 format
-    }
-}
 
-// Store the GNSS response for parsing
-static char *gnss_response = NULL;
-static bool gnss_info_received = false;
-
-// Berry function callbacks for connection events
-static void *be_modem_connect_cb = NULL;       // On connect callback
-static void *be_modem_disconnect_cb = NULL;    // On disconnect callback
-
-// GNSS info line handler callback
-static esp_err_t gnss_info_line_handler(uint8_t *data, size_t len) {
-    if (data == NULL || len == 0) {
-        return ESP_FAIL;
-    }
-    
-    char *line = (char *)data;
-    
-    // Different modems have different response prefixes
-    const char* sim7600_prefix = "+CGNSINF: ";
-    const char* bg96_prefix = "+QGPSLOC: ";
-    const char* sim800_prefix = "+CGPSINF: ";
-    
-    // Check for the appropriate prefix based on modem type
-    const char* prefix = NULL;
-    switch (g_modem_type) {
-        case MODEM_TYPE_SIM7600:
-            prefix = sim7600_prefix;
-            break;
-        case MODEM_TYPE_BG96:
-            prefix = bg96_prefix;
-            break;
-        case MODEM_TYPE_SIM800:
-            prefix = sim800_prefix;
-            break;
-        case MODEM_TYPE_GENERIC:
-        default:
-            prefix = sim7600_prefix; // Default to SIM7600 format
-            break;
-    }
-    
-    // Look for the GNSS info response
-    if (strncmp(line, prefix, strlen(prefix)) == 0) {
-        // Make a copy of the response for parsing
-        if (gnss_response != NULL) {
-            free(gnss_response);
-        }
-        gnss_response = strdup(line);
-        gnss_info_received = true;
-        return ESP_OK;
-    }
-    
-    return ESP_OK;
-}
-
-// Function declarations for Berry VM
-static int w_modem_init(bvm *vm);
-static int w_modem_init_usb(bvm *vm);
+// Forward declarations for Berry VM functions
+static int w_modem_init(bvm *vm);           // Was w_modem_setup_environment
+static int w_modem_deinit(bvm *vm);         // New
 static int w_modem_connect(bvm *vm);
 static int w_modem_disconnect(bvm *vm);
 static int w_modem_status(bvm *vm);
-static int w_modem_power_on(bvm *vm);
-static int w_modem_power_off(bvm *vm);
-static int w_modem_set_power_pin(bvm *vm);
-static int w_modem_set_reset_pin(bvm *vm);
-static int w_modem_reset(bvm *vm);
 static int w_modem_get_gnss_info(bvm *vm);
 static int w_modem_set_type(bvm *vm);
 static int w_modem_get_type(bvm *vm);
 static int w_modem_get_msisdn(bvm *vm);
 static int w_modem_send_sms(bvm *vm);
-static int w_modem_on_connect(bvm *vm);
-static int w_modem_on_disconnect(bvm *vm);
+// Callbacks on_connect/on_disconnect will need to use the event system of usbh_modem_board
+// static int w_modem_on_event(bvm *vm); // New, to register a generic event handler
 
-// Need to export these symbols for Berry VM
-BE_EXPORT_VARIABLE extern const bclass be_class_modem;
+// Helper for GNSS/SMS if we can send AT commands (currently placeholder)
+// static char *gnss_response = NULL;
+// static bool gnss_info_received = false;
 
-// External function from be_modem_factory_bridge.cpp
-extern esp_err_t modem_bridge_set_module_type(esp_modem_dce_t *dce, const char *module_type);
+// --- Removed GPIO and old USB init related static functions ---
 
-// Function to configure modem power pin
-static int w_modem_set_power_pin(bvm *vm) {
-    int top = be_top(vm);
+// Event handler to be passed to modem_board_init if user registers one
+static void modem_event_proxy_handler(void *handler_arg, esp_event_base_t base, int32_t id, void *event_data) {
+    // This is called by the modem_board component's event loop.
+    // We need to call the user's Berry function.
+    // This requires careful handling of VM state and is more complex.
+    // For now, let's keep it simple or defer full Berry callback integration.
+    ESP_LOGI(TAG, "Modem Board Event: Base=%s, ID=%d", base, (int)id);
+
+    if (g_user_event_handler) { // This is a C callback, not a Berry function directly yet
+      // To call a Berry function, we'd need to get the VM, push args, pcall.
+      // For now, just logging.
+    }
+}
+
+
+// Initialize the modem using iot_usbh_modem
+static int w_modem_init(bvm *vm) { // Replaces w_modem_setup_environment
+    if (g_modem_board_initialized) {
+        ESP_LOGW(TAG, "Modem board already initialized.");
+        be_pushbool(vm, true);
+        be_return(vm);
+    }
+
+    ESP_LOGI(TAG, "Initializing modem board...");
+    modem_config_t modem_config = MODEM_DEFAULT_CONFIG();
     
-    if (top >= 1 && be_isint(vm, 1)) {
-        int8_t pin = be_toint(vm, 1);
-        
-        if (pin >= 0) {
-            // Configure the pin as output
-            pinMode(pin, OUTPUT);
-            g_modem_power_pin = pin;
-            ESP_LOGI(TAG, "Modem power pin set to GPIO%d", pin);
-            be_pushbool(vm, true);
-        } else {
-            g_modem_power_pin = -1;
-            ESP_LOGW(TAG, "Invalid modem power pin: %d", pin);
-            be_pushbool(vm, false);
-        }
+    // Don't start PPP automatically, let Berry script control it
+    modem_config.flags |= MODEM_FLAGS_INIT_NOT_ENTER_PPP;
+    // Don't block init waiting for IP
+    modem_config.flags |= MODEM_FLAGS_INIT_NOT_BLOCK;
+
+    // TODO: Expose event handler registration to Berry if needed
+    // For now, we can use a simple C proxy if a C callback is registered from Berry later.
+    // modem_config.handler = modem_event_proxy_handler;
+    // modem_config.handler_arg = NULL; // Or pass some context
+
+    esp_err_t err = modem_board_init(&modem_config);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Modem board initialized successfully.");
+        g_modem_board_initialized = true;
+        be_pushbool(vm, true);
     } else {
-        be_raise(vm, "value_error", "Pin number required");
-        be_return(vm);
+        ESP_LOGE(TAG, "Failed to initialize modem board: %s", esp_err_to_name(err));
+        g_modem_board_initialized = false;
+        be_pushbool(vm, false);
     }
-    
     be_return(vm);
 }
 
-// Function to configure modem reset pin
-static int w_modem_set_reset_pin(bvm *vm) {
-    int top = be_top(vm);
-    
-    if (top >= 1 && be_isint(vm, 1)) {
-        int8_t pin = be_toint(vm, 1);
-        
-        if (pin >= 0) {
-            // Configure the pin as output
-            pinMode(pin, OUTPUT);
-            g_modem_reset_pin = pin;
-            ESP_LOGI(TAG, "Modem reset pin set to GPIO%d", pin);
-            be_pushbool(vm, true);
-        } else {
-            g_modem_reset_pin = -1;
-            ESP_LOGW(TAG, "Invalid modem reset pin: %d", pin);
-            be_pushbool(vm, false);
-        }
+// Deinitialize the modem
+static int w_modem_deinit(bvm *vm) {
+    if (!g_modem_board_initialized) {
+        ESP_LOGW(TAG, "Modem board not initialized.");
+        be_pushbool(vm, true); // Or false, as it wasn't init
+        be_return(vm);
+    }
+
+    ESP_LOGI(TAG, "Deinitializing modem board...");
+    esp_err_t err = modem_board_deinit();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Modem board deinitialized successfully.");
+        g_modem_board_initialized = false;
+        be_pushbool(vm, true);
     } else {
-        be_raise(vm, "value_error", "Pin number required");
-        be_return(vm);
+        ESP_LOGE(TAG, "Failed to deinitialize modem board: %s", esp_err_to_name(err));
+        be_pushbool(vm, false); // Still consider it de-initialized for our flag
+        g_modem_board_initialized = false;
     }
-    
-    be_return(vm);
-}
-
-// Modem power control functions
-static int w_modem_power_on(bvm *vm) {
-    int top = be_top(vm);
-    
-    // Check if the power pin is configured
-    if (g_modem_power_pin < 0) {
-        ESP_LOGW(TAG, "Modem power pin not configured");
-        be_pushbool(vm, false);
-        be_return(vm);
-    }
-    
-    // Power on sequence
-    ESP_LOGI(TAG, "Powering on modem via GPIO%d", g_modem_power_pin);
-    digitalWrite(g_modem_power_pin, HIGH);
-    delay(100);
-    digitalWrite(g_modem_power_pin, LOW);
-    delay(5000); // Wait for modem to initialize
-    
-    be_pushbool(vm, true);
-    be_return(vm);
-}
-
-static int w_modem_power_off(bvm *vm) {
-    int top = be_top(vm);
-    
-    // Check if the power pin is configured
-    if (g_modem_power_pin < 0) {
-        ESP_LOGW(TAG, "Modem power pin not configured");
-        be_pushbool(vm, false);
-        be_return(vm);
-    }
-    
-    // Power off sequence
-    ESP_LOGI(TAG, "Powering off modem via GPIO%d", g_modem_power_pin);
-    digitalWrite(g_modem_power_pin, HIGH);
-    delay(800);
-    digitalWrite(g_modem_power_pin, LOW);
-
-    // If we have a modem DCE, clean it up
-    if (g_modem_dce != NULL) {
-        esp_modem_destroy(g_modem_dce);
-        g_modem_dce = NULL;
-    }
-    
-    // If we have a netif, clean it up
-    if (g_modem_netif != NULL) {
-        esp_netif_destroy(g_modem_netif);
-        g_modem_netif = NULL;
-    }
-    
-    be_pushbool(vm, true);
-    be_return(vm);
-}
-
-// Modem reset function
-static int w_modem_reset(bvm *vm) {
-    int top = be_top(vm);
-    
-    // Check if the reset pin is configured
-    if (g_modem_reset_pin < 0) {
-        ESP_LOGW(TAG, "Modem reset pin not configured");
-        be_pushbool(vm, false);
-        be_return(vm);
-    }
-    
-    // Reset sequence
-    ESP_LOGI(TAG, "Resetting modem via GPIO%d", g_modem_reset_pin);
-    digitalWrite(g_modem_reset_pin, HIGH);
-    delay(200);  // Hold reset for 200ms
-    digitalWrite(g_modem_reset_pin, LOW);
-    delay(3000); // Wait for modem to restart
-    
-    be_pushbool(vm, true);
-    be_return(vm);
-}
-
-// Get GNSS information from the modem
-static int w_modem_get_gnss_info(bvm *vm) {
-    int top = be_top(vm);
-    
-    if (g_modem_dce == NULL) {
-        be_raise(vm, "runtime_error", "Modem not initialized");
-        be_return(vm);
-    }
-
-    // Free any previous response
-    if (gnss_response != NULL) {
-        free(gnss_response);
-        gnss_response = NULL;
-    }
-    
-    // Reset the flag
-    gnss_info_received = false;
-
-    // Send AT command for GNSS info based on modem type
-    esp_err_t err = esp_modem_command(g_modem_dce, get_gnss_command(), gnss_info_line_handler, 2000);
-
-    if (err != ESP_OK) {
-        be_raise(vm, "runtime_error", "Failed to execute GNSS command");
-        be_return(vm);
-    }
-    
-    // Check if we got a response
-    if (!gnss_info_received || gnss_response == NULL) {
-        be_raise(vm, "runtime_error", "No GNSS data received");
-        be_return(vm);
-    }
-
-    // Parse the gnss_response
-    // +CGNSINF: <run_status>,<fix_status>,<UTC>,<lat>,<lon>,<alt>,<speed_knots>,<course>,<fix_mode>,<res1>,<hdop>,<pdop>,<vdop>,<res2>,<sats_in_view>,<sats_used>,<glonass_sats_in_view>,<res3>,<cn0_max>,<hpa>,<vpa>
-    int run_status = 0, fix_status = 0, fix_mode = 0, sats_in_view = 0, sats_used = 0, cn0_max = 0;
-    char utc_datetime[20] = {0};
-    double latitude = 0.0, longitude = 0.0, altitude = 0.0, speed_knots = 0.0, course = 0.0;
-    double hdop = 0.0, pdop = 0.0, vdop = 0.0, hpa = 0.0, vpa = 0.0;
-    // Use dummy vars for reserved fields if sscanf requires them
-    char dummy1[10], dummy2[10], dummy3[10], dummy4[10];
-
-    // Be careful with sscanf, it can be tricky. Check the number of fields assigned.
-    int fields = sscanf(gnss_response, 
-                        "%d,%d,%18[^,],%lf,%lf,%lf,%lf,%lf,%d,%[^,],%lf,%lf,%lf,%[^,],%d,%d,%[^,],%[^,],%d,%lf,%lf",
-                        &run_status, &fix_status, utc_datetime,
-                        &latitude, &longitude, &altitude,
-                        &speed_knots, &course, &fix_mode,
-                        dummy1, &hdop, &pdop, &vdop, dummy2,
-                        &sats_in_view, &sats_used, dummy3, dummy4,
-                        &cn0_max, &hpa, &vpa);
-
-    if (fields < 17) { // Check if we parsed at least up to sats_used (adjust count as needed)
-        ESP_LOGE("modem.gnss", "Failed to parse GNSS info: %s (fields=%d)", gnss_response, fields);
-        be_raise(vm, "value_error", "Failed to parse GNSS info");
-        be_return(vm);
-    }
-
-    // Process parsed data
-    bool fixed = (fix_status == 1);
-    double speed_kph = speed_knots * 1.852;
-
-    // Extract Date and Time from UTC string (YYYYMMDDHHMMSS.sss)
-    char date_str[9] = {0}; // YYYYMMDD
-    char time_str[7] = {0}; // HHMMSS
-    if (strlen(utc_datetime) >= 14) {
-        strncpy(date_str, utc_datetime, 8);
-        strncpy(time_str, utc_datetime + 8, 6);
-    }
-
-    // Create Berry map object
-    be_newmap(vm);
-
-    be_pushbool(vm, fixed);
-    be_setmember(vm, -2, "fixed");
-    
-    be_pushreal(vm, latitude);
-    be_setmember(vm, -2, "latitude");
-    
-    be_pushreal(vm, longitude);
-    be_setmember(vm, -2, "longitude");
-    
-    be_pushreal(vm, altitude);
-    be_setmember(vm, -2, "altitude");
-    
-    be_pushreal(vm, speed_kph); // Use converted speed
-    be_setmember(vm, -2, "speed");
-    
-    be_pushreal(vm, course);
-    be_setmember(vm, -2, "course");
-    
-    be_pushint(vm, sats_used); // Use sats_used field
-    be_setmember(vm, -2, "satellites_used");
-    
-    be_pushint(vm, sats_in_view); // Use sats_in_view field
-    be_setmember(vm, -2, "satellites_in_view");
-    
-    be_pushstring(vm, date_str);
-    be_setmember(vm, -2, "date");
-    
-    be_pushstring(vm, time_str);
-    be_setmember(vm, -2, "time");
-
-    // Add HDOP, PDOP, VDOP for extra info
-    be_pushreal(vm, hdop);
-    be_setmember(vm, -2, "hdop");
-    be_pushreal(vm, pdop);
-    be_setmember(vm, -2, "pdop");
-    be_pushreal(vm, vdop);
-    be_setmember(vm, -2, "vdop");
-
-    // Add C/N0 max
-    be_pushint(vm, cn0_max);
-    be_setmember(vm, -2, "cn0_max");
-    
-    // Leave the map object on top
-    be_pop(vm, be_top(vm) - top - 1); 
-    be_return(vm);
-}
-
-// Initialize the modem
-static int w_modem_init(bvm *vm) {
-    int top = be_top(vm);
-    
-    ESP_LOGI(TAG, "Initializing modem");
-    
-    // Create a PPP netif instance
-    esp_netif_config_t netif_ppp_config = ESP_NETIF_DEFAULT_PPP();
-    g_modem_netif = esp_netif_new(&netif_ppp_config);
-    if (g_modem_netif == NULL) {
-        ESP_LOGE(TAG, "Failed to create netif instance");
-        be_raise(vm, "value_error", "Failed to create netif instance");
-        be_return(vm);
-    }
-    
-    // Set up DTE configuration (for UART by default, but we'll use USB in the future)
-    // For now, just use a placeholder DTE config since we'll need to use a USB-specific one
-    esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_CONFIG();
-    
-    // Set up DCE configuration
-    esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG("internet");
-    
-    // Create the DCE using esp_modem_new_dev() with a specific model
-    g_modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENERIC, &dte_config, &dce_config, g_modem_netif);
-    
-    if (g_modem_dce == NULL) {
-        ESP_LOGE(TAG, "Failed to create modem DCE");
-        esp_netif_destroy(g_modem_netif);
-        g_modem_netif = NULL;
-        be_raise(vm, "value_error", "Failed to initialize modem");
-        be_return(vm);
-    }
-    
-    ESP_LOGI(TAG, "Modem initialized successfully");
-    be_pushbool(vm, true);
-    be_return(vm);
-}
-
-// Initialize the modem with USB DTE
-static int w_modem_init_usb(bvm *vm) {
-    int top = be_top(vm);
-    
-    ESP_LOGI(TAG, "Initializing modem with USB DTE");
-    
-    // Extract parameters if provided (vid, pid, interface)
-    uint16_t vid = 0x2C7C;  // Default to BG96
-    uint16_t pid = 0x0296;
-    int interface_idx = 2;
-    
-    if (top >= 1 && be_isint(vm, 1)) {
-        vid = (uint16_t)be_toint(vm, 1);
-    }
-    
-    if (top >= 2 && be_isint(vm, 2)) {
-        pid = (uint16_t)be_toint(vm, 2);
-    }
-    
-    if (top >= 3 && be_isint(vm, 3)) {
-        interface_idx = be_toint(vm, 3);
-    }
-    
-    ESP_LOGI(TAG, "USB Modem VID:PID=%04x:%04x, Interface=%d", 
-             vid, pid, interface_idx);
-    
-    // Create a PPP netif instance
-    esp_netif_config_t netif_ppp_config = ESP_NETIF_DEFAULT_PPP();
-    g_modem_netif = esp_netif_new(&netif_ppp_config);
-    if (g_modem_netif == NULL) {
-        ESP_LOGE(TAG, "Failed to create netif instance");
-        be_raise(vm, "value_error", "Failed to create netif instance");
-        be_return(vm);
-    }
-    
-    // Configure USB DTE
-    struct esp_modem_usb_term_config usb_config = ESP_MODEM_DEFAULT_USB_CONFIG(vid, pid, interface_idx);
-    
-    // Create DTE config using the USB configuration
-    esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_USB_CONFIG(usb_config);
-    
-    // Set up DCE configuration
-    esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG("internet");
-    
-    // Create the DCE using esp_modem_new_dev()
-    g_modem_dce = esp_modem_new_dev(ESP_MODEM_DCE_GENERIC, &dte_config, &dce_config, g_modem_netif);
-    
-    if (g_modem_dce == NULL) {
-        ESP_LOGE(TAG, "Failed to create modem DCE with USB");
-        esp_netif_destroy(g_modem_netif);
-        g_modem_netif = NULL;
-        be_raise(vm, "value_error", "Failed to initialize modem with USB");
-        be_return(vm);
-    }
-    
-    ESP_LOGI(TAG, "USB Modem initialized successfully");
-    be_pushbool(vm, true);
     be_return(vm);
 }
 
 // Connect to the cellular network
 static int w_modem_connect(bvm *vm) {
-    int top = be_top(vm);
-
-    if (!g_modem_dce) {
-        be_raise(vm, "value_error", "Modem not initialized");
+    if (!g_modem_board_initialized) {
+        be_raise(vm, "runtime_error", "Modem not initialized. Call modem.init() first.");
         be_return(vm);
     }
 
-    // Extract parameters if provided (APN, username, password)
-    const char *apn = "internet";  // Default APN
-    const char *username = "";     // Default empty username
-    const char *password = "";     // Default empty password
-    
+    const char *apn = NULL;
     if (be_top(vm) >= 1 && be_isstring(vm, 1)) {
         apn = be_tostring(vm, 1);
-    }
-    if (be_top(vm) >= 2 && be_isstring(vm, 2)) {
-        username = be_tostring(vm, 2);
-    }
-    if (be_top(vm) >= 3 && be_isstring(vm, 3)) {
-        password = be_tostring(vm, 3);
-    }
-    
-    ESP_LOGI(TAG, "Connecting with APN: %s", apn);
-    
-    // Set up the APN
-    esp_err_t err = esp_modem_set_apn(g_modem_dce, apn);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set APN: %s", esp_err_to_name(err));
-        be_raise(vm, "value_error", "Failed to set APN");
-        be_return(vm);
-    }
-    
-    // Switch to data mode (this starts PPP)
-    err = esp_modem_set_mode(g_modem_dce, ESP_MODEM_MODE_DATA);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to switch to data mode: %s", esp_err_to_name(err));
-        be_raise(vm, "value_error", "Failed to start PPP");
-        be_return(vm);
-    }
-    
-    // Invoke the connect callback if registered
-    if (be_modem_connect_cb != NULL) {
-        be_getglobal(vm, "_modem_connect_cb");
-        if (!be_isnil(vm, -1)) {
-            be_pushbool(vm, true); // Connection success
-            be_pcall(vm, 1);
-            be_pop(vm, 1); // Remove result from the stack
+        ESP_LOGI(TAG, "Setting APN to: %s", apn);
+        esp_err_t apn_err = modem_board_set_apn(apn, true); // true to force re-dial if APN changes
+        if (apn_err != ESP_OK && apn_err != ESP_ERR_INVALID_STATE /* APN already same */) {
+            ESP_LOGE(TAG, "Failed to set APN: %s", esp_err_to_name(apn_err));
+            be_pushbool(vm, false);
+            be_return(vm);
         }
-        be_pop(vm, 1); // Remove function from the stack
     }
     
-    be_pushbool(vm, true);
+    ESP_LOGI(TAG, "Attempting to start PPP connection...");
+    // Timeout for ppp_start, e.g., 60 seconds. 
+    // The function itself might be non-blocking if MODEM_FLAGS_INIT_NOT_BLOCK was set.
+    // We need a way to confirm connection.
+    esp_err_t err = modem_board_ppp_start(60000); 
+    
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "PPP start command issued. Waiting for connection...");
+        // modem_board_ppp_start might be non-blocking. 
+        // For a synchronous connect, we'd need to wait for MODEM_EVENT_NET_CONN
+        // or poll a status function. For now, assume it tries to connect.
+        // A true "connected" state needs IP_EVENT_PPP_GOT_IP.
+        be_pushbool(vm, true); // Indicates command was accepted
+    } else {
+        ESP_LOGE(TAG, "Failed to start PPP connection: %s", esp_err_to_name(err));
+        be_pushbool(vm, false);
+    }
     be_return(vm);
 }
 
 // Disconnect from the cellular network
 static int w_modem_disconnect(bvm *vm) {
-    int top = be_top(vm);
-    
-    if (!g_modem_dce) {
-        be_raise(vm, "value_error", "Modem not initialized");
+    if (!g_modem_board_initialized) {
+        be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
     
-    ESP_LOGI(TAG, "Disconnecting modem");
+    ESP_LOGI(TAG, "Attempting to stop PPP connection...");
+    esp_err_t err = modem_board_ppp_stop(10000); // 10s timeout for ppp_stop
     
-    // Switch back to command mode (this stops PPP)
-    esp_err_t err = esp_modem_set_mode(g_modem_dce, ESP_MODEM_MODE_COMMAND);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to switch to command mode: %s", esp_err_to_name(err));
-        be_raise(vm, "value_error", "Failed to stop PPP");
-        be_return(vm);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "PPP stop command issued.");
+        be_pushbool(vm, true);
+    } else {
+        ESP_LOGE(TAG, "Failed to stop PPP connection: %s", esp_err_to_name(err));
+        be_pushbool(vm, false);
     }
-    
-    // Invoke the disconnect callback if registered
-    if (be_modem_disconnect_cb != NULL) {
-        be_getglobal(vm, "_modem_disconnect_cb");
-        if (!be_isnil(vm, -1)) {
-            be_pushbool(vm, true); // Disconnection success
-            be_pcall(vm, 1);
-            be_pop(vm, 1); // Remove result from the stack
-        }
-        be_pop(vm, 1); // Remove function from the stack
-    }
-    
-    be_pushbool(vm, true);
     be_return(vm);
 }
 
 // Get modem status
 static int w_modem_status(bvm *vm) {
-    int top = be_top(vm);
-    esp_err_t err; // Use for checking API call results
-    
-    if (g_modem_dce == NULL) {
-        be_raise(vm, "value_error", "Modem not initialized");
+    if (!g_modem_board_initialized) {
+        be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
     
-    // Create a map to return the status information
-    be_newmap(vm); // Use be_newmap instead of be_newobject("map") for consistency
-    
-    // Check current mode
-    esp_modem_dce_mode_t mode = esp_modem_get_mode(g_modem_dce);
-    bool is_connected = (mode == ESP_MODEM_MODE_DATA);
-    
-    be_pushbool(vm, is_connected);
+    be_newmap(vm);
+    esp_err_t err;
+
+    // Connected status (placeholder - needs proper check)
+    // This requires checking if the PPP netif has an IP.
+    // The iot_usbh_modem internal s_modem_evt_hdl has PPP_NET_CONNECT_BIT.
+    // We need a helper like `bool modem_board_is_connected()`
+    bool is_connected_placeholder = false; 
+    // Example: esp_netif_t *ppp_netif = esp_netif_get_handle_from_ifkey("PPP_DEF");
+    // if (ppp_netif) { esp_netif_ip_info_t ip_info; if (esp_netif_get_ip_info(ppp_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) is_connected_placeholder = true; }
+    be_pushbool(vm, is_connected_placeholder); // Placeholder!
     be_setmember(vm, -2, "connected");
-    
-    // Get signal quality if we're in command mode or can pause data mode
-    int rssi = -1; // Initialize to invalid
-    int ber = -1;  // Initialize to invalid
-    
-    if (mode == ESP_MODEM_MODE_COMMAND) {
-        err = esp_modem_get_signal_quality(g_modem_dce, &rssi, &ber);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to get signal quality: %s", esp_err_to_name(err));
-            rssi = -1; // Ensure invalid on error
-            ber = -1;
-        }
-    } else if (mode == ESP_MODEM_MODE_DATA) {
-        // Temporarily pause network to get signal quality
-        err = esp_modem_pause_net(g_modem_dce, true);
-        if (err == ESP_OK) {
-            err = esp_modem_get_signal_quality(g_modem_dce, &rssi, &ber);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to get signal quality during pause: %s", esp_err_to_name(err));
-                rssi = -1;
-                ber = -1;
-            }
-            // Resume network
-            err = esp_modem_pause_net(g_modem_dce, false);
-            if (err != ESP_OK) {
-                 ESP_LOGW(TAG, "Failed to resume net after signal quality check: %s", esp_err_to_name(err));
-            }
-        } else {
-            ESP_LOGW(TAG, "Failed to pause net for signal quality check: %s", esp_err_to_name(err));
-        }
+
+    // Signal Quality
+    int rssi = -1, ber = -1;
+    err = modem_board_get_signal_quality(&rssi, &ber);
+    if (err == ESP_OK) {
+        be_pushint(vm, rssi);
+        be_setmember(vm, -2, "rssi");
+        be_pushint(vm, ber);
+        be_setmember(vm, -2, "ber");
+    } else {
+        ESP_LOGW(TAG, "Failed to get signal quality: %s", esp_err_to_name(err));
+        be_pushint(vm, -1); be_setmember(vm, -2, "rssi");
+        be_pushint(vm, -1); be_setmember(vm, -2, "ber");
+    }
+
+    // SIM Card State
+    int sim_ready = 0; // 0 for not ready/error, 1 for ready
+    err = modem_board_get_sim_cart_state(&sim_ready); // Note: API uses int*, not bool*
+    if (err == ESP_OK) {
+        be_pushbool(vm, (bool)sim_ready);
+        be_setmember(vm, -2, "sim_ready");
+    } else {
+        ESP_LOGW(TAG, "Failed to get SIM card state: %s", esp_err_to_name(err));
+        be_pushbool(vm, false); be_setmember(vm, -2, "sim_ready");
     }
     
-    be_pushint(vm, rssi);
-    be_setmember(vm, -2, "rssi");
-    
-    be_pushint(vm, ber);
-    be_setmember(vm, -2, "ber");
-
-    // --- Added Fields --- 
-
     // Operator Name
-    char operator_name[32] = {0};
-    int act = -1; // Access technology (required by API)
-    err = esp_modem_get_operator_name(g_modem_dce, operator_name, &act);
+    char operator_name[64] = {0};
+    err = modem_board_get_operator_state(operator_name, sizeof(operator_name));
     if (err == ESP_OK) {
         be_pushstring(vm, operator_name);
         be_setmember(vm, -2, "operator");
-        
-        be_pushint(vm, act);
-        be_setmember(vm, -2, "operator_act");
     } else {
         ESP_LOGW(TAG, "Failed to get operator name: %s", esp_err_to_name(err));
-        be_pushstring(vm, ""); // Push empty string on error
-        be_setmember(vm, -2, "operator");
-        
-        be_pushint(vm, -1);
-        be_setmember(vm, -2, "operator_act");
-    }
-
-    // Battery Status
-    int charge_status = -1, battery_level = -1, voltage = -1;
-    err = esp_modem_get_battery_status(g_modem_dce, &charge_status, &battery_level, &voltage);
-    if (err == ESP_OK) {
-        be_pushint(vm, charge_status);
-        be_setmember(vm, -2, "charge_status");
-        be_pushint(vm, battery_level);
-        be_setmember(vm, -2, "battery_level");
-        be_pushint(vm, voltage);
-        be_setmember(vm, -2, "voltage_mv");
-    } else {
-        ESP_LOGW(TAG, "Failed to get battery status: %s", esp_err_to_name(err));
-        be_pushint(vm, -1);
-        be_setmember(vm, -2, "charge_status");
-        be_pushint(vm, -1);
-        be_setmember(vm, -2, "battery_level");
-        be_pushint(vm, -1);
-        be_setmember(vm, -2, "voltage_mv");
-    }
-
-    // IMEI
-    char imei[16] = {0}; // IMEI is typically 15 digits + null terminator
-    err = esp_modem_get_imei(g_modem_dce, imei);
-    if (err == ESP_OK) {
-        be_pushstring(vm, imei);
-        be_setmember(vm, -2, "imei");
-    } else {
-        ESP_LOGW(TAG, "Failed to get IMEI: %s", esp_err_to_name(err));
-        be_pushstring(vm, ""); 
-        be_setmember(vm, -2, "imei");
-    }
-
-    // IMSI
-    char imsi[16] = {0}; // IMSI is typically 15 digits + null terminator
-    err = esp_modem_get_imsi(g_modem_dce, imsi);
-    if (err == ESP_OK) {
-        be_pushstring(vm, imsi);
-        be_setmember(vm, -2, "imsi");
-    } else {
-        ESP_LOGW(TAG, "Failed to get IMSI: %s", esp_err_to_name(err));
-        be_pushstring(vm, "");
-        be_setmember(vm, -2, "imsi");
-    }
-
-    // --- End Added Fields ---
-    
-    // Get IP information if connected
-    // Note: Getting the actual IP would require using ESP-NETIF APIs
-    // which can be added later if needed
-    if (is_connected) {
-        // Placeholder IP address
-        be_pushstring(vm, "0.0.0.0");
-        be_setmember(vm, -2, "ip");
+        be_pushstring(vm, ""); be_setmember(vm, -2, "operator");
     }
     
-    // Add GPIO pin info
-    be_pushint(vm, g_modem_power_pin);
-    be_setmember(vm, -2, "power_pin");
+    // IMEI / IMSI - Not directly available in usbh_modem_board.h API
+    // Would require sending AT commands. Placeholder for now.
+    be_pushstring(vm, "N/A"); be_setmember(vm, -2, "imei");
+    be_pushstring(vm, "N/A"); be_setmember(vm, -2, "imsi");
     
-    be_pushint(vm, g_modem_reset_pin);
-    be_setmember(vm, -2, "reset_pin");
+    // IP Address - Placeholder
+    // Would need to get it from the PPP netif
+    be_pushstring(vm, "0.0.0.0"); be_setmember(vm, -2, "ip");
     
-    be_pop(vm, be_top(vm) - top - 1); // Leave the map object on top
+    // Remove return value of be_pop, not used
+    be_pop(vm, be_top(vm) - 1 -1); // Leave the map object on top
     be_return(vm);
 }
 
 // Set the modem module type (runtime configuration)
 static int w_modem_set_type(bvm *vm) {
-    int top = be_top(vm);
-    
+    // This function might be less relevant if iot_usbh_modem handles type specifics internally
+    // or if AT commands for GNSS/SMS are routed through a generic command sender.
+    // For now, just store it locally if needed for custom AT command construction.
     if (!be_isstring(vm, 1)) {
         be_raise(vm, "type_error", "Expected string modem type");
         be_return(vm);
     }
+    const char *module_type_str = be_tostring(vm, 1);
+    ESP_LOGI(TAG, "Setting modem type to %s (for Berry lib internal use)", module_type_str);
     
-    const char *module_type = be_tostring(vm, 1);
-    ESP_LOGI(TAG, "Setting modem type to %s", module_type);
-    
-    // Convert string to modem type enum
-    if (strcasecmp(module_type, "SIM7600") == 0) {
-        g_modem_type = MODEM_TYPE_SIM7600;
-        ESP_LOGI(TAG, "Modem type set to SIM7600");
-    } 
-    else if (strcasecmp(module_type, "SIM800") == 0) {
-        g_modem_type = MODEM_TYPE_SIM800;
-        ESP_LOGI(TAG, "Modem type set to SIM800");
-    }
-    else if (strcasecmp(module_type, "BG96") == 0) {
-        g_modem_type = MODEM_TYPE_BG96;
-        ESP_LOGI(TAG, "Modem type set to BG96");
-    }
-    else if (strcasecmp(module_type, "GENERIC") == 0) {
-        g_modem_type = MODEM_TYPE_GENERIC;
-        ESP_LOGI(TAG, "Modem type set to GENERIC");
-    }
-    else {
-        be_raise(vm, "value_error", "Unknown modem type");
-        be_return(vm);
-    }
+    if (strcasecmp(module_type_str, "SIM7600") == 0) g_modem_type = MODEM_TYPE_SIM7600;
+    else if (strcasecmp(module_type_str, "SIM800") == 0) g_modem_type = MODEM_TYPE_SIM800;
+    else if (strcasecmp(module_type_str, "BG96") == 0) g_modem_type = MODEM_TYPE_BG96;
+    else g_modem_type = MODEM_TYPE_GENERIC;
     
     be_pushbool(vm, true);
     be_return(vm);
@@ -782,252 +302,70 @@ static int w_modem_set_type(bvm *vm) {
 
 // Get modem type as string
 static int w_modem_get_type(bvm *vm) {
-    int top = be_top(vm);
-    
     const char* type_str = "UNKNOWN";
-    
     switch (g_modem_type) {
-        case MODEM_TYPE_SIM7600:
-            type_str = "SIM7600";
-            break;
-        case MODEM_TYPE_SIM800:
-            type_str = "SIM800";
-            break;
-        case MODEM_TYPE_BG96:
-            type_str = "BG96";
-            break;
-        case MODEM_TYPE_GENERIC:
-            type_str = "GENERIC";
-            break;
+        case MODEM_TYPE_SIM7600: type_str = "SIM7600"; break;
+        case MODEM_TYPE_SIM800:  type_str = "SIM800"; break;
+        case MODEM_TYPE_BG96:    type_str = "BG96"; break;
+        case MODEM_TYPE_GENERIC: type_str = "GENERIC"; break;
     }
-    
     be_pushstring(vm, type_str);
     be_return(vm);
 }
 
-// Track the SMS send status
-static bool sms_send_success = false;
 
-// Callback for the SMS text mode command
-static esp_err_t sms_mode_handler(uint8_t *data, size_t len) {
-    // Just looking for "OK" response, which is handled by default
-    return ESP_OK;
-}
-
-// Callback for SMS send command - looking for ">" prompt
-static esp_err_t sms_send_handler(uint8_t *data, size_t len) {
-    // Looking for ">" prompt that indicates the modem is ready for the message
-    if (len == 1 && data[0] == '>') {
-        return ESP_FAIL; // Return ESP_FAIL to stop further line processing
+// --- Placeholder / To Be Implemented with AT command sending via new driver ---
+static int w_modem_get_gnss_info(bvm *vm) {
+    if (!g_modem_board_initialized) {
+        be_raise(vm, "runtime_error", "Modem not initialized.");
+        be_return(vm);
     }
-    return ESP_OK;
+    ESP_LOGW(TAG, "GNSS info not yet implemented with new driver.");
+    be_raise(vm, "runtime_error", "GNSS not implemented");
+    be_return(vm);
 }
 
-// Callback for SMS send content - checking for final response
-static esp_err_t sms_content_handler(uint8_t *data, size_t len) {
-    // Response will look like:
-    // +CMGS: <mr>
-    // OK
-    const char* prefix = "+CMGS: ";
-    size_t prefix_len = strlen(prefix);
-    
-    if (len > prefix_len && strncmp((const char*)data, prefix, prefix_len) == 0) {
-        sms_send_success = true;
-    }
-    return ESP_OK;
-}
-
-// Send an SMS message
 static int w_modem_send_sms(bvm *vm) {
-    int top = be_top(vm);
-    
-    if (g_modem_dce == NULL) {
-        be_raise(vm, "runtime_error", "Modem not initialized");
+     if (!g_modem_board_initialized) {
+        be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
-    
-    if (!be_isstring(vm, 1) || !be_isstring(vm, 2)) {
-        be_raise(vm, "type_error", "Expected string phone number and message");
-        be_return(vm);
-    }
-    
-    // Get phone number and message from arguments
-    const char *phone_number = be_tostring(vm, 1);
-    const char *message = be_tostring(vm, 2);
-    
-    // Step 1: Set SMS text mode
-    esp_err_t err = esp_modem_command(g_modem_dce, "AT+CMGF=1\r", sms_mode_handler, 1000);
-    if (err != ESP_OK) {
-        be_raise(vm, "runtime_error", "Failed to set SMS text mode");
-        be_return(vm);
-    }
-    
-    // Step 2: Start SMS send command with phone number
-    char send_cmd[64];
-    snprintf(send_cmd, sizeof(send_cmd), "AT+CMGS=\"%s\"\r", phone_number);
-    err = esp_modem_command(g_modem_dce, send_cmd, sms_send_handler, 5000);
-    if (err != ESP_OK) {
-        be_raise(vm, "runtime_error", "Failed to initiate SMS send");
-        be_return(vm);
-    }
-    
-    // Step 3: Send the message content followed by Ctrl+Z
-    char *content_cmd;
-    size_t content_len = strlen(message);
-    // Allocate buffer for message + Ctrl+Z + terminating null
-    content_cmd = malloc(content_len + 2);
-    if (!content_cmd) {
-        be_raise(vm, "memory_error", "Failed to allocate memory for SMS content");
-        be_return(vm);
-    }
-    
-    // Copy message and append Ctrl+Z
-    strcpy(content_cmd, message);
-    content_cmd[content_len] = 26; // Ctrl+Z
-    content_cmd[content_len + 1] = '\0';
-    
-    // Reset success flag
-    sms_send_success = false;
-    
-    // Send the content
-    err = esp_modem_command(g_modem_dce, content_cmd, sms_content_handler, 10000);
-    free(content_cmd); // Free allocated memory
-    
-    if (err != ESP_OK) {
-        be_raise(vm, "runtime_error", "Failed to send SMS content");
-        be_return(vm);
-    }
-    
-    // Return success status
-    be_pushbool(vm, sms_send_success);
+    ESP_LOGW(TAG, "SMS sending not yet implemented with new driver.");
+    be_raise(vm, "runtime_error", "SMS not implemented");
     be_return(vm);
 }
 
-// Buffer to store CNUM response
-static char msisdn_buffer[32] = {0};
-static bool msisdn_received = false;
-
-// Callback for CNUM command
-static esp_err_t msisdn_line_handler(uint8_t *data, size_t len) {
-    // The response format is +CNUM: "","<number>",<type>
-    // e.g. +CNUM: "","12345678901",145
-    const char* prefix = "+CNUM: ";
-    size_t prefix_len = strlen(prefix);
-    
-    if (len > prefix_len && strncmp((const char*)data, prefix, prefix_len) == 0) {
-        // Reset before parsing
-        msisdn_buffer[0] = '\0';
-        msisdn_received = false;
-        
-        // Extract the number part 
-        char* start = strchr((char*)data + prefix_len, ',');
-        if (start != NULL) {
-            start++; // Move past the comma
-            if (*start == '"') start++; // Move past quote if present
-            
-            char* end = strchr(start, ',');
-            if (end != NULL) {
-                if (*(end-1) == '"') end--; // Move before quote if present
-                
-                // Copy the number part
-                size_t number_len = end - start;
-                if (number_len < sizeof(msisdn_buffer)) {
-                    strncpy(msisdn_buffer, start, number_len);
-                    msisdn_buffer[number_len] = '\0';
-                    msisdn_received = true;
-                    ESP_LOGI(TAG, "MSISDN received: %s", msisdn_buffer);
-                }
-            }
-        }
-    }
-    return ESP_OK;
-}
-
-// Get the phone number (MSISDN) from the SIM card
 static int w_modem_get_msisdn(bvm *vm) {
-    int top = be_top(vm);
-    
-    if (g_modem_dce == NULL) {
-        be_raise(vm, "runtime_error", "Modem not initialized");
+    if (!g_modem_board_initialized) {
+        be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
-    
-    // Reset before sending command
-    msisdn_buffer[0] = '\0';
-    msisdn_received = false;
-    
-    // Send AT+CNUM command to get the subscriber number
-    esp_err_t err = esp_modem_command(g_modem_dce, "AT+CNUM\r", msisdn_line_handler, 2000);
-    if (err != ESP_OK) {
-        be_raise(vm, "runtime_error", "Failed to execute AT+CNUM");
-        be_return(vm);
-    }
-    
-    if (!msisdn_received) {
-        // We didn't get a proper response, return empty string
-        be_pushstring(vm, "");
-    } else {
-        be_pushstring(vm, msisdn_buffer);
-    }
-    
+    ESP_LOGW(TAG, "MSISDN retrieval not yet implemented with new driver.");
+    be_pushstring(vm, ""); // Return empty string
     be_return(vm);
 }
 
-// Register a function to be called when modem connects
-static int w_modem_on_connect(bvm *vm) {
-    int top = be_top(vm);
-    
-    if (top >= 1 && (be_isfunction(vm, 1) || be_isclosure(vm, 1))) {
-        // Store the callback in the global '_modem_connect_cb'
-        be_pushvalue(vm, 1);
-        be_setglobal(vm, "_modem_connect_cb");
-        be_modem_connect_cb = (void*)1;  // Just mark that callback is registered (non-NULL)
-        be_pushbool(vm, true);
-    } else {
-        be_raise(vm, "type_error", "callback required");
-        be_return(vm);
-    }
-    
-    be_return(vm);
-}
 
-// Register a function to be called when modem disconnects
-static int w_modem_on_disconnect(bvm *vm) {
-    int top = be_top(vm);
-    
-    if (top >= 1 && (be_isfunction(vm, 1) || be_isclosure(vm, 1))) {
-        // Store the callback in the global '_modem_disconnect_cb'
-        be_pushvalue(vm, 1);
-        be_setglobal(vm, "_modem_disconnect_cb");
-        be_modem_disconnect_cb = (void*)1;  // Just mark that callback is registered (non-NULL)
-        be_pushbool(vm, true);
-    } else {
-        be_raise(vm, "type_error", "callback required");
-        be_return(vm);
-    }
-    
-    be_return(vm);
-}
+// --- End Placeholder sections ---
+
 
 /* @const_object_info_begin
 module modem (scope: global, strings: weak) {
     init, func(w_modem_init)
-    init_usb, func(w_modem_init_usb)
+    deinit, func(w_modem_deinit)
     connect, func(w_modem_connect)
     disconnect, func(w_modem_disconnect)
     status, func(w_modem_status)
-    set_power_pin, func(w_modem_set_power_pin)
-    set_reset_pin, func(w_modem_set_reset_pin)
-    power_on, func(w_modem_power_on)
-    power_off, func(w_modem_power_off)
-    reset, func(w_modem_reset)
+    
+    // Placeholders, to be re-implemented if AT command sending is available
     gnss, func(w_modem_get_gnss_info)
-    set_type, func(w_modem_set_type)
-    get_type, func(w_modem_get_type)
+    set_type, func(w_modem_set_type) // May be useful for constructing AT commands
+    get_type, func(w_modem_get_type) // May be useful for constructing AT commands
     msisdn, func(w_modem_get_msisdn)
     send_sms, func(w_modem_send_sms)
-    on_connect, func(w_modem_on_connect)
-    on_disconnect, func(w_modem_on_disconnect)
+
+    // Removed: init_uart, init_usb, set_power_pin, set_reset_pin, power_on, power_off, reset
+    // Callbacks on_connect/on_disconnect might be replaced by a generic on_event
 }
 @const_object_info_end */
 

@@ -1,0 +1,31 @@
+{
+    "name": "iot_usbh_modem",
+    "version": "1.0.0",
+    "description": "ESP-IDF USB Host Modem Driver",
+    "keywords": "esp32, modem, usb, ppp",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/espressif/esp-iot-solution"
+    },
+    "authors": [
+        {
+            "name": "Espressif Systems",
+            "email": "info@espressif.com"
+        }
+    ],
+    "platforms": ["espressif32"],
+    "frameworks": ["arduino", "espidf"],
+    "build": {
+        "includeDir": "include",
+        "srcDir": "src",
+        "flags": [
+            "-Iprivate_include"
+        ],
+        "exclude": [
+            "test_apps"
+        ]
+    },
+    "dependencies": [
+        "iot_usbh_cdc"
+    ]
+}

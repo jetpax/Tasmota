@@ -612,11 +612,11 @@ int be_isfile(const char *path)
     return res == 0 && !S_ISDIR(path_stat.st_mode);
 }
 
-int be_isexist(const char *path)
-{
-    struct stat path_stat;
-    return stat(path, &path_stat) == 0;
-}
+// int be_isexist(const char *path)
+// {
+//     struct stat path_stat;
+//     return stat(path, &path_stat) == 0;
+// }
 
 char* be_getcwd(char *buf, size_t size)
 {
@@ -637,11 +637,6 @@ int be_mkdir(const char *path)
 #endif
 }
 
-int be_unlink(const char *filename)
-{
-    return remove(filename);
-}
-
 int be_dirfirst(bdirinfo *info, const char *path)
 {
     info->dir = opendir(path);
@@ -654,7 +649,7 @@ int be_dirfirst(bdirinfo *info, const char *path)
 int be_dirnext(bdirinfo *info)
 {
     struct dirent *file;
-    info->file = file = readdir(info->dir);
+    info->file = file = readdir((DIR*)info->dir);
     if (file) {
         info->name = file->d_name;
         return 0;
@@ -664,7 +659,7 @@ int be_dirnext(bdirinfo *info)
 
 int be_dirclose(bdirinfo *info)
 {
-    return closedir(info->dir) != 0;
+    return closedir((DIR*)info->dir) != 0;
 }
 
 #endif /* POSIX */
