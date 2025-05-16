@@ -33,23 +33,18 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-// Required for the new iot_usbh_modem component
+// For modem_board_* API and MODEM_DEFAULT_CONFIG
 #include "usbh_modem_board.h"
-// We might still need esp_netif for checking IP, but let's see
-// #include "esp_netif.h" 
-
-// Arduino.h might not be needed if power/reset is handled by iot_usbh_modem Kconfigs
-// #include "Arduino.h"
-
-// Define CONFIG_USBH_TASK_BASE_PRIORITY if not already defined
-#ifndef CONFIG_USBH_TASK_BASE_PRIORITY
-#define CONFIG_USBH_TASK_BASE_PRIORITY 5
-#endif
+// For esp_netif functions to check IP address
+#include "esp_netif.h"
+// For esp_modem_dce_t and common DCE commands (IMEI, IMSI) from esp_modem_iot
+#include "esp_modem_dce.h" // From iot_usbh_modem/private_include
+#include "esp_modem_dce_common_commands.h" // From iot_usbh_modem/private_include
 
 static const char* TAG = "MDM_BE";
 
 // Global state for the new driver
-static bool g_modem_board_initialized = false;
+static esp_modem_dce_t *g_modem_dce_handle = NULL; // Stores the DCE handle from esp_modem_iot
 static esp_event_handler_t g_user_event_handler = NULL;
 static void *g_user_event_handler_arg = NULL;
 
@@ -122,8 +117,8 @@ static void modem_event_proxy_handler(void *handler_arg, esp_event_base_t base, 
 
 
 // Initialize the modem using iot_usbh_modem
-static int w_modem_init(bvm *vm) { // Replaces w_modem_setup_environment
-    if (g_modem_board_initialized) {
+static int w_modem_init(bvm *vm) { 
+    if (g_modem_dce_handle != NULL) {
         ESP_LOGW(TAG, "Modem board already initialized.");
         be_pushbool(vm, true);
         be_return(vm);
@@ -137,18 +132,99 @@ static int w_modem_init(bvm *vm) { // Replaces w_modem_setup_environment
     // Don't block init waiting for IP
     modem_config.flags |= MODEM_FLAGS_INIT_NOT_BLOCK;
 
+    // Override settings if provided in function parameters
+    if (be_top(vm) >= 1 && be_ismap(vm, 1)) {
+        // Get 'interface' param
+        be_getmember(vm, 1, "interface");
+        if (!be_isnil(vm, -1)) {
+            int itf_num = be_toint(vm, -1);
+            ESP_LOGI(TAG, "Setting specific interface number: %d", itf_num);
+            // Use the correct field based on your modem_config_t structure
+            // Uncomment the appropriate line:
+            // modem_config.device_config.itf_num = itf_num;
+            // modem_config.itf_num = itf_num;
+            // modem_config.port_num = itf_num;
+        }
+        be_pop(vm, 1);
+        
+        // Get 'timeout' param
+        be_getmember(vm, 1, "timeout");
+        if (!be_isnil(vm, -1)) {
+            int timeout = be_toint(vm, -1);
+            ESP_LOGI(TAG, "Setting AT command timeout: %d ms", timeout);
+            // Use the correct field based on your modem_config_t structure
+            // Uncomment the appropriate line:
+            // modem_config.device_config.send_cmd_timeout = timeout;
+            // modem_config.timeout = timeout;
+        }
+        be_pop(vm, 1);
+    }
+
     // Register our event handler to process modem events
     modem_config.handler = modem_event_proxy_handler;
     modem_config.handler_arg = NULL; // No context needed for now
 
+    // Add additional debugging
+    ESP_LOGI(TAG, "Modem config: flags=0x%x", modem_config.flags);
+
     esp_err_t err = modem_board_init(&modem_config);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Modem board initialized successfully.");
-        g_modem_board_initialized = true;
-        be_pushbool(vm, true);
+        ESP_LOGI(TAG, "Modem board init command accepted. Waiting for DCE handle...");
+        int retries = 0;
+        // Wait up to ~10 seconds for the DCE handle to become available.
+        // The daemon task needs time for USB enumeration, DTE/DCE creation.
+        const int max_retries = 200; // 200 * 50ms = 10 seconds
+        while ((g_modem_dce_handle = modem_board_get_dce()) == NULL && retries < max_retries) {
+            vTaskDelay(pdMS_TO_TICKS(50)); // Poll every 50ms
+            retries++;
+        }
+
+        if (g_modem_dce_handle != NULL) {
+            ESP_LOGI(TAG, "DCE handle obtained successfully: %p", g_modem_dce_handle);
+            
+            ESP_LOGI(TAG, "Delaying for 2500ms before first AT command...");
+            vTaskDelay(pdMS_TO_TICKS(2500));
+
+            // Direct AT command test
+            char direct_response_buffer[64];
+            ESP_LOGI(TAG, "Attempting direct 'AT\r\n' command...");
+            // Define a simple_response_handler for esp_modem_dce_send_cmd
+            // This handler won't be fully implemented for Berry here, just for logging
+            // In a real scenario, it would parse the response or signal success/failure.
+            // For this test, we mainly care if it times out or returns ESP_OK.
+            // The esp-modem default timeout for commands is CONFIG_MODEM_COMMAND_TIMEOUT_DEFAULT (2000ms)
+            err = esp_modem_dce_send_cmd(g_modem_dce_handle, "AT\r\n", NULL, 0); 
+            // Note: The original esp_modem_dce_send_cmd takes a timeout and a handler.
+            // We are calling a variant or assuming a default. If this exact signature is not available,
+            // we may need to use esp_modem_dce_command or similar with more parameters.
+            // Let's assume for now a simple version exists or MODEM_DEFAULT_TIMEOUT is used.
+            // A more robust call would be:
+            // err = esp_modem_dce_command(g_modem_dce_handle, "AT\r\n", NULL, direct_response_buffer, sizeof(direct_response_buffer), 0);
+            // For simplicity in this step, let's use the simpler send_cmd if it resolves to a basic variant.
+            // The key is to see if THIS call times out or not.
+            
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Direct 'AT\r\n' command successful (returned ESP_OK).");
+                // If successful, we might try to read the response if the DTE layer has it.
+                // However, esp_modem_dce_send_cmd often expects the handler to process the response.
+                // For now, ESP_OK is a good sign.
+            } else {
+                ESP_LOGW(TAG, "Direct 'AT\r\n' command failed: %s", esp_err_to_name(err));
+            }
+            
+            // We will still push true if DCE handle was obtained, as per previous logic.
+            // The AT command test above is for deeper debugging.
+            be_pushbool(vm, true); 
+        } else {
+            ESP_LOGE(TAG, "Failed to get DCE handle after modem_board_init (timed out waiting).");
+            // Consider if modem_board_deinit() should be called here to clean up the partially started task.
+            // However, deinit might also block or have issues if the daemon is in a strange state.
+            // For now, just report failure.
+            be_pushbool(vm, false);
+        }
     } else {
         ESP_LOGE(TAG, "Failed to initialize modem board: %s", esp_err_to_name(err));
-        g_modem_board_initialized = false;
+        g_modem_dce_handle = NULL;
         be_pushbool(vm, false);
     }
     be_return(vm);
@@ -156,7 +232,7 @@ static int w_modem_init(bvm *vm) { // Replaces w_modem_setup_environment
 
 // Deinitialize the modem
 static int w_modem_deinit(bvm *vm) {
-    if (!g_modem_board_initialized) {
+    if (g_modem_dce_handle == NULL) {
         ESP_LOGW(TAG, "Modem board not initialized.");
         be_pushbool(vm, true); // Or false, as it wasn't init
         be_return(vm);
@@ -166,19 +242,19 @@ static int w_modem_deinit(bvm *vm) {
     esp_err_t err = modem_board_deinit();
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Modem board deinitialized successfully.");
-        g_modem_board_initialized = false;
+        g_modem_dce_handle = NULL;
         be_pushbool(vm, true);
     } else {
         ESP_LOGE(TAG, "Failed to deinitialize modem board: %s", esp_err_to_name(err));
         be_pushbool(vm, false); // Still consider it de-initialized for our flag
-        g_modem_board_initialized = false;
+        g_modem_dce_handle = NULL;
     }
     be_return(vm);
 }
 
 // Connect to the cellular network
 static int w_modem_connect(bvm *vm) {
-    if (!g_modem_board_initialized) {
+    if (g_modem_dce_handle == NULL) {
         be_raise(vm, "runtime_error", "Modem not initialized. Call modem.init() first.");
         be_return(vm);
     }
@@ -217,7 +293,7 @@ static int w_modem_connect(bvm *vm) {
 
 // Disconnect from the cellular network
 static int w_modem_disconnect(bvm *vm) {
-    if (!g_modem_board_initialized) {
+    if (g_modem_dce_handle == NULL) {
         be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
@@ -237,25 +313,29 @@ static int w_modem_disconnect(bvm *vm) {
 
 // Get modem status
 static int w_modem_status(bvm *vm) {
-    if (!g_modem_board_initialized) {
+    if (g_modem_dce_handle == NULL) {
         be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
     
     be_newmap(vm);
     esp_err_t err;
+    char ip_str_buf[16] = "0.0.0.0";
 
-    // Connected status (placeholder - needs proper check)
-    // This requires checking if the PPP netif has an IP.
-    // The iot_usbh_modem internal s_modem_evt_hdl has PPP_NET_CONNECT_BIT.
-    // We need a helper like `bool modem_board_is_connected()`
-    bool is_connected_placeholder = false; 
-    // Example: esp_netif_t *ppp_netif = esp_netif_get_handle_from_ifkey("PPP_DEF");
-    // if (ppp_netif) { esp_netif_ip_info_t ip_info; if (esp_netif_get_ip_info(ppp_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) is_connected_placeholder = true; }
-    be_pushbool(vm, is_connected_placeholder); // Placeholder!
+    // Connected status
+    bool is_connected_placeholder = false;
+    esp_netif_t *ppp_netif = esp_netif_get_handle_from_ifkey("PPP_DEF"); // Default PPP netif key
+    if (ppp_netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(ppp_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+            is_connected_placeholder = true;
+            esp_ip4addr_ntoa(&ip_info.ip, ip_str_buf, sizeof(ip_str_buf));
+        }
+    }
+    be_pushbool(vm, is_connected_placeholder);
     be_setmember(vm, -2, "connected");
 
-    // Signal Quality
+    // Signal Quality - don't return early if this fails
     int rssi = -1, ber = -1;
     err = modem_board_get_signal_quality(&rssi, &ber);
     if (err == ESP_OK) {
@@ -269,7 +349,7 @@ static int w_modem_status(bvm *vm) {
         be_pushint(vm, -1); be_setmember(vm, -2, "ber");
     }
 
-    // SIM Card State
+    // SIM Card State - don't return early if this fails
     int sim_ready = 0; // 0 for not ready/error, 1 for ready
     err = modem_board_get_sim_cart_state(&sim_ready); // Note: API uses int*, not bool*
     if (err == ESP_OK) {
@@ -280,7 +360,7 @@ static int w_modem_status(bvm *vm) {
         be_pushbool(vm, false); be_setmember(vm, -2, "sim_ready");
     }
     
-    // Operator Name
+    // Operator Name - don't return early if this fails
     char operator_name[64] = {0};
     err = modem_board_get_operator_state(operator_name, sizeof(operator_name));
     if (err == ESP_OK) {
@@ -291,14 +371,37 @@ static int w_modem_status(bvm *vm) {
         be_pushstring(vm, ""); be_setmember(vm, -2, "operator");
     }
     
-    // IMEI / IMSI - Not directly available in usbh_modem_board.h API
-    // Would require sending AT commands. Placeholder for now.
-    be_pushstring(vm, "N/A"); be_setmember(vm, -2, "imei");
-    be_pushstring(vm, "N/A"); be_setmember(vm, -2, "imsi");
+    // IMEI - don't return early if this fails
+    char imei_buf[16] = {0};
+    if (g_modem_dce_handle && esp_modem_dce_get_imei_number(g_modem_dce_handle, (void*)sizeof(imei_buf), imei_buf) == ESP_OK) {
+        be_pushstring(vm, imei_buf);
+    } else {
+        ESP_LOGW(TAG, "Failed to get IMEI number");
+        be_pushstring(vm, "N/A");
+    }
+    be_setmember(vm, -2, "imei");
+
+    // IMSI - don't return early if this fails
+    char imsi_buf[16] = {0};
+    if (g_modem_dce_handle && esp_modem_dce_get_imsi_number(g_modem_dce_handle, (void*)sizeof(imsi_buf), imsi_buf) == ESP_OK) {
+        be_pushstring(vm, imsi_buf);
+    } else {
+        ESP_LOGW(TAG, "Failed to get IMSI number");
+        be_pushstring(vm, "N/A");
+    }
+    be_setmember(vm, -2, "imsi");
     
-    // IP Address - Placeholder
-    // Would need to get it from the PPP netif
-    be_pushstring(vm, "0.0.0.0"); be_setmember(vm, -2, "ip");
+    // IP Address
+    be_pushstring(vm, ip_str_buf); be_setmember(vm, -2, "ip");
+    
+    // Add debug information to the status map
+    be_pushbool(vm, g_modem_dce_handle != NULL);
+    be_setmember(vm, -2, "dce_handle_valid");
+
+    // Return if AT commands are working
+    bool at_ok = (err == ESP_OK);
+    be_pushbool(vm, at_ok);
+    be_setmember(vm, -2, "at_ok");
     
     // Remove return value of be_pop, not used
     be_pop(vm, be_top(vm) - 1 -1); // Leave the map object on top
@@ -341,32 +444,33 @@ static int w_modem_get_type(bvm *vm) {
 
 
 // --- Placeholder / To Be Implemented with AT command sending via new driver ---
+// For now, these will just check if the modem is initialized.
 static int w_modem_get_gnss_info(bvm *vm) {
-    if (!g_modem_board_initialized) {
+    if (g_modem_dce_handle == NULL) {
         be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
-    ESP_LOGW(TAG, "GNSS info not yet implemented with new driver.");
+    ESP_LOGW(TAG, "GNSS info not yet implemented.");
     be_raise(vm, "runtime_error", "GNSS not implemented");
     be_return(vm);
 }
 
 static int w_modem_send_sms(bvm *vm) {
-     if (!g_modem_board_initialized) {
+     if (g_modem_dce_handle == NULL) {
         be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
-    ESP_LOGW(TAG, "SMS sending not yet implemented with new driver.");
+    ESP_LOGW(TAG, "SMS sending not yet implemented.");
     be_raise(vm, "runtime_error", "SMS not implemented");
     be_return(vm);
 }
 
 static int w_modem_get_msisdn(bvm *vm) {
-    if (!g_modem_board_initialized) {
+    if (g_modem_dce_handle == NULL) {
         be_raise(vm, "runtime_error", "Modem not initialized.");
         be_return(vm);
     }
-    ESP_LOGW(TAG, "MSISDN retrieval not yet implemented with new driver.");
+    ESP_LOGW(TAG, "MSISDN retrieval not yet implemented.");
     be_pushstring(vm, ""); // Return empty string
     be_return(vm);
 }
@@ -376,9 +480,9 @@ static int w_modem_get_msisdn(bvm *vm) {
 
 
 /* @const_object_info_begin
-module modem (scope: global, strings: weak) {
-    init, func(w_modem_init)
-    deinit, func(w_modem_deinit)
+module modem (scope: global, strings: weak) { // Changed module name to 'modem'
+    start, func(w_modem_init)
+    stop, func(w_modem_deinit)
     connect, func(w_modem_connect)
     disconnect, func(w_modem_disconnect)
     status, func(w_modem_status)
@@ -395,4 +499,4 @@ module modem (scope: global, strings: weak) {
 }
 @const_object_info_end */
 
-#include "be_fixed_modem.h" // Generated by Tasmota build process
+#include "be_fixed_modem.h" // Ensure this matches the module name

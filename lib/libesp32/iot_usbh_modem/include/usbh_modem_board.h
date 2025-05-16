@@ -8,6 +8,8 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 
+#include "esp_modem_dce.h"
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -142,6 +144,14 @@ esp_err_t modem_board_ppp_start(uint32_t timeout_ms);
  * @return ** esp_err_t
  */
 esp_err_t modem_board_ppp_stop(uint32_t timeout_ms);
+
+/**
+ * @brief Get the underlying esp_modem_dce_t handle
+ *
+ * @return esp_modem_dce_t* pointer to the DCE handle, or NULL if not initialized.
+ */
+esp_modem_dce_t* modem_board_get_dce(void);
+
 
 #ifdef __cplusplus
 }

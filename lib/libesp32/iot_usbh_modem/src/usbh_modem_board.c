@@ -834,3 +834,8 @@ esp_err_t modem_board_ppp_stop(uint32_t timeout_ms)
     ESP_LOGI(TAG, "PPP stop succeed");
     return ESP_OK;
 }
+
+esp_modem_dce_t* modem_board_get_dce(void)
+{
+    return s_dce;
+}

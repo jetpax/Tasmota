@@ -3,6 +3,9 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#ifndef LOG_LOCAL_LEVEL
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#endif
 
 #include <string.h>
 #include <stdbool.h>
@@ -11,6 +14,7 @@
 #include "usb/usb_helpers.h"
 #include "iot_usbh_descriptor.h"
 #include "usb/usb_types_ch9.h"
+#include "esp_log.h"
 
 static const char *TAG = "cdc_descriptor";
 
@@ -86,15 +90,15 @@ esp_err_t cdc_parse_interface_descriptor(const usb_device_desc_t *device_desc, c
         if (USB_EP_DESC_GET_XFERTYPE(this_ep) == USB_TRANSFER_TYPE_INTR) {
             info_ret->notif_intf = first_intf_desc;
             info_ret->notif_ep = this_ep;
-            printf("Found NOTIF endpoint: %d\n", this_ep->bEndpointAddress);
+            ESP_LOGI( TAG, "Found NOTIF endpoint: %d\n", this_ep->bEndpointAddress);
         } else if (USB_EP_DESC_GET_XFERTYPE(this_ep) == USB_TRANSFER_TYPE_BULK) {
             info_ret->data_intf = first_intf_desc;
             if (USB_EP_DESC_GET_EP_DIR(this_ep)) {
                 info_ret->in_ep = this_ep;
-                printf("Found IN endpoint: %d\n", this_ep->bEndpointAddress);
+                ESP_LOGI( TAG, "Found IN endpoint: %d\n", this_ep->bEndpointAddress);
             } else {
                 info_ret->out_ep = this_ep;
-                printf("Found OUT endpoint: %d\n", this_ep->bEndpointAddress);
+                ESP_LOGI( TAG, "Found OUT endpoint: %d\n", this_ep->bEndpointAddress);
             }
         }
         desc_offset = temp_offset;
@@ -118,10 +122,10 @@ esp_err_t cdc_parse_interface_descriptor(const usb_device_desc_t *device_desc, c
                         info_ret->data_intf = second_intf_desc;
                         if (USB_EP_DESC_GET_EP_DIR(this_ep)) {
                             info_ret->in_ep = this_ep;
-                            printf("Found IN endpoint: %d\n", this_ep->bEndpointAddress);
+                            ESP_LOGI( TAG, "Found IN endpoint: %d\n", this_ep->bEndpointAddress);
                         } else {
                             info_ret->out_ep = this_ep;
-                            printf("Found OUT endpoint: %d\n", this_ep->bEndpointAddress);
+                            ESP_LOGI( TAG, "Found OUT endpoint: %d\n", this_ep->bEndpointAddress);
                         }
                     }
                     desc_offset = temp_offset;
