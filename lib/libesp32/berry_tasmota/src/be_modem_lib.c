@@ -1,6 +1,10 @@
 /*
-  be_modem_lib.c - Berry module for esp_modem PPPoS over USB
-  
+  be_modem_lib.c - Berry module for USB WAN modem
+
+  assumes USB modem exposes multiple interfaces:
+  - the AT interface is used for setting up the modem and PPP and retreiving status.
+  - the PPP interface is used for PPP operations, including IP address allocation.
+
   Copyright (C) 2025  Jonathan E. Peace
 
   This program is free software: you can redistribute it and/or modify
@@ -32,7 +36,6 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h" // For NMEA queue
 #include <ctype.h>        // For isspace in sms_prompt_handler
 
 // For modem_board_* API and MODEM_DEFAULT_CONFIG
@@ -49,11 +52,6 @@ static const char* TAG = "MDM_BE";
 static esp_modem_dce_t *g_modem_dce_handle = NULL; // Stores the DCE handle from esp_modem_iot
 static esp_event_handler_t g_user_event_handler = NULL;
 static void *g_user_event_handler_arg = NULL;
-
-// NMEA Data Queue
-#define NMEA_QUEUE_LENGTH 10
-#define NMEA_MAX_SENTENCE_LENGTH 90 // NMEA sentences are typically <= 82 chars + null
-static QueueHandle_t nmea_data_queue = NULL;
 
 // Modem type - used to customize AT commands for different modems (may still be needed for GNSS/SMS)
 typedef enum {
@@ -172,7 +170,6 @@ static void modem_event_proxy_handler(void *handler_arg, esp_event_base_t base, 
     }
 }
 
-
 // Initialize the modem using iot_usbh_modem
 static int w_modem_init(bvm *vm) { 
     if (g_modem_dce_handle != NULL) {
@@ -259,33 +256,17 @@ static int w_modem_init(bvm *vm) {
                  // The esp_modem_dce_default_init should populate this.
             }
             
-            // Initialize NMEA queue if not already
-            if (!nmea_data_queue) {
-                nmea_data_queue = xQueueCreate(NMEA_QUEUE_LENGTH, sizeof(char*));
-                if (nmea_data_queue == NULL) {
-                    ESP_LOGE(TAG, "Failed to create NMEA queue!");
-                    // This is a problem, but init might still be considered "partially" successful for AT commands.
-                    // Or we could fail the whole init here. For now, just log.
-                } else {
-                    ESP_LOGI(TAG, "NMEA queue created.");
-                }
-            }
+            // NMEA queue init was here - removed
             be_pushbool(vm, true); 
         } else {
             ESP_LOGE(TAG, "Failed to get DCE handle after modem_board_init (timed out waiting).");
-            if (nmea_data_queue) { // Clean up queue if it was somehow created before DCE failed
-                vQueueDelete(nmea_data_queue);
-                nmea_data_queue = NULL;
-            }
+            // NMEA queue cleanup was here - removed
             be_pushbool(vm, false);
         }
     } else {
         ESP_LOGE(TAG, "Failed to initialize modem board: %s", esp_err_to_name(err));
         g_modem_dce_handle = NULL;
-        if (nmea_data_queue) { // Clean up queue if it was created in a previous partial init
-             vQueueDelete(nmea_data_queue);
-             nmea_data_queue = NULL;
-        }
+        // NMEA queue cleanup was here - removed
         be_pushbool(vm, false);
     }
     be_return(vm);
@@ -304,23 +285,13 @@ static int w_modem_deinit(bvm *vm) {
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Modem board deinitialized successfully.");
         g_modem_dce_handle = NULL;
-        if (nmea_data_queue != NULL) {
-            ESP_LOGI(TAG, "Clearing and deleting NMEA queue...");
-            char* temp_ptr;
-            while(xQueueReceive(nmea_data_queue, &temp_ptr, 0) == pdPASS) {
-                if (temp_ptr) { // Should always be true if only non-NULL pointers were added
-                    free(temp_ptr);
-                }
-            }
-            vQueueDelete(nmea_data_queue);
-            nmea_data_queue = NULL;
-            ESP_LOGI(TAG, "NMEA queue deleted.");
-        }
+        // NMEA queue deinit was here - removed
         be_pushbool(vm, true);
     } else {
         ESP_LOGE(TAG, "Failed to deinitialize modem board: %s", esp_err_to_name(err));
         be_pushbool(vm, false); // Still consider it de-initialized for our flag
         g_modem_dce_handle = NULL;
+        // NMEA queue cleanup was here - removed
     }
     be_return(vm);
 }
@@ -384,31 +355,57 @@ static int w_modem_disconnect(bvm *vm) {
     be_return(vm);
 }
 
-// Get modem status
+// Get modem dynamic status (connection, IP, signal, registration)
 static int w_modem_status(bvm *vm) {
     if (g_modem_dce_handle == NULL) {
         be_raise(vm, "runtime_error", "Modem not initialized.");
-        be_return(vm);
+        return -1;
     }
     
     be_newmap(vm);
     esp_err_t err;
     char ip_str_buf[16] = "0.0.0.0";
+    char gw_str_buf[16] = "0.0.0.0";
+    char dns1_str_buf[16] = "0.0.0.0";
+    char dns2_str_buf[16] = "0.0.0.0";
+    bool is_connected = false;
 
-    // Connected status
-    bool is_connected_placeholder = false;
-    esp_netif_t *ppp_netif = esp_netif_get_handle_from_ifkey("PPP_DEF"); // Default PPP netif key
+    // PPP Connection status, IP Address, Gateway
+    esp_netif_t *ppp_netif = esp_netif_get_handle_from_ifkey("PPP_DEF");
     if (ppp_netif) {
         esp_netif_ip_info_t ip_info;
         if (esp_netif_get_ip_info(ppp_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            is_connected_placeholder = true;
+            is_connected = true;
             esp_ip4addr_ntoa(&ip_info.ip, ip_str_buf, sizeof(ip_str_buf));
+            esp_ip4addr_ntoa(&ip_info.gw, gw_str_buf, sizeof(gw_str_buf));
         }
-    }
-    be_pushbool(vm, is_connected_placeholder);
-    be_setmember(vm, -2, "connected");
 
-    // Signal Quality - don't return early if this fails
+        // DNS Servers
+        esp_netif_dns_info_t dns_info;
+        if (esp_netif_get_dns_info(ppp_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK) {
+            if (dns_info.ip.type == ESP_IPADDR_TYPE_V4) {
+                esp_ip4addr_ntoa(&dns_info.ip.u_addr.ip4, dns1_str_buf, sizeof(dns1_str_buf));
+            } // Add V6 handling if needed
+        }
+        if (esp_netif_get_dns_info(ppp_netif, ESP_NETIF_DNS_BACKUP, &dns_info) == ESP_OK) {
+            if (dns_info.ip.type == ESP_IPADDR_TYPE_V4) {
+                esp_ip4addr_ntoa(&dns_info.ip.u_addr.ip4, dns2_str_buf, sizeof(dns2_str_buf));
+            } // Add V6 handling if needed
+        }
+        // Could also try ESP_NETIF_DNS_FALLBACK if needed
+    }
+    be_pushbool(vm, is_connected);
+    be_setmember(vm, -2, "connected");
+    be_pushstring(vm, ip_str_buf);
+    be_setmember(vm, -2, "ip");
+    be_pushstring(vm, gw_str_buf);
+    be_setmember(vm, -2, "gateway");
+    be_pushstring(vm, dns1_str_buf);
+    be_setmember(vm, -2, "dns1");
+    be_pushstring(vm, dns2_str_buf);
+    be_setmember(vm, -2, "dns2");
+
+    // Signal Quality
     int rssi = -1, ber = -1;
     err = modem_board_get_signal_quality(&rssi, &ber);
     if (err == ESP_OK) {
@@ -418,70 +415,212 @@ static int w_modem_status(bvm *vm) {
         be_setmember(vm, -2, "ber");
     } else {
         ESP_LOGW(TAG, "Failed to get signal quality: %s", esp_err_to_name(err));
-        be_pushint(vm, -1); be_setmember(vm, -2, "rssi");
-        be_pushint(vm, -1); be_setmember(vm, -2, "ber");
+        be_pushint(vm, -999); // Use a distinct error value for rssi
+        be_setmember(vm, -2, "rssi");
+        be_pushint(vm, -999); // Use a distinct error value for ber
+        be_setmember(vm, -2, "ber");
     }
 
-    // SIM Card State - don't return early if this fails
-    int sim_ready = 0; // 0 for not ready/error, 1 for ready
-    err = modem_board_get_sim_cart_state(&sim_ready); // Note: API uses int*, not bool*
-    if (err == ESP_OK) {
-        be_pushbool(vm, (bool)sim_ready);
-        be_setmember(vm, -2, "sim_ready");
+    // Network Registration State (AT+CREG?)
+    at_cmd_handler_ctx_t creg_ctx;
+    memset(&creg_ctx, 0, sizeof(at_cmd_handler_ctx_t));
+    char creg_cmd[] = "AT+CREG?\r";
+    int reg_n = -1, reg_stat = -1;
+
+    err = esp_modem_dce_generic_command(g_modem_dce_handle, creg_cmd, CONFIG_MODEM_COMMAND_TIMEOUT_DEFAULT, at_cmd_response_handler, &creg_ctx);
+    if (err == ESP_OK && creg_ctx.command_status == ESP_OK && creg_ctx.response_buffer) {
+        // Expected response: +CREG: <n>,<stat>[,<lac>,<ci>[,<AcT>]]
+        // Or just +CREG: <stat> if <n> was set to 0 by a previous AT+CREG=<n>
+        char *p = strstr(creg_ctx.response_buffer, "+CREG:");
+        if (p) {
+            p += strlen("+CREG:");
+            while (*p == ' ' || *p == '\t') p++; // Skip whitespace
+            // Try parsing two values first, then one if that fails
+            if (sscanf(p, "%d,%d", &reg_n, &reg_stat) == 2) {
+                // Successfully parsed <n> and <stat>
+            } else if (sscanf(p, "%d", &reg_stat) == 1) {
+                // Successfully parsed only <stat> (assuming n=0 was set previously)
+                reg_n = 0; // Assume n was previously set to 0
+            } else {
+                ESP_LOGW(TAG, "Could not parse CREG response: %s", creg_ctx.response_buffer);
+                reg_stat = -1; // Parse error
+            }
+        } else {
+            ESP_LOGW(TAG, "+CREG: prefix not found in response: %s", creg_ctx.response_buffer);
+            reg_stat = -1; // Prefix not found
+        }
+        free(creg_ctx.response_buffer);
     } else {
-        ESP_LOGW(TAG, "Failed to get SIM card state: %s", esp_err_to_name(err));
-        be_pushbool(vm, false); be_setmember(vm, -2, "sim_ready");
+        ESP_LOGW(TAG, "AT+CREG? failed. IDF err: %s, Modem status: %s", esp_err_to_name(err), esp_err_to_name(creg_ctx.command_status));
+        if (creg_ctx.response_buffer) free(creg_ctx.response_buffer);
+        reg_stat = -1; // Command failed
     }
-    
-    // Operator Name - don't return early if this fails
-    char operator_name[64] = {0};
-    err = modem_board_get_operator_state(operator_name, sizeof(operator_name));
-    if (err == ESP_OK) {
-        be_pushstring(vm, operator_name);
-        be_setmember(vm, -2, "operator");
-    } else {
-        ESP_LOGW(TAG, "Failed to get operator name: %s", esp_err_to_name(err));
-        be_pushstring(vm, ""); be_setmember(vm, -2, "operator");
+    be_pushint(vm, reg_stat);
+    be_setmember(vm, -2, "reg_status");
+    // Optional: Push n as well if needed: be_pushint(vm, reg_n); be_setmember(vm, -2, "reg_mode");
+
+    be_return(vm); // Return the map
+}
+
+// Get modem static information (IMEI, IMSI, MSISDN, ICCID, etc.)
+static int w_modem_info(bvm *vm) {
+    if (g_modem_dce_handle == NULL) {
+        be_raise(vm, "runtime_error", "Modem not initialized.");
+        return -1;
     }
-    
-    // IMEI - don't return early if this fails
-    char imei_buf[32] = {0}; // Increased buffer size for safety
-    if (g_modem_dce_handle && esp_modem_dce_get_imei_number(g_modem_dce_handle, (void*)sizeof(imei_buf), imei_buf) == ESP_OK) {
-        be_pushstring(vm, imei_buf);
+
+    be_newmap(vm);
+    esp_err_t err;
+    char buffer[128]; // General purpose buffer for AT command responses
+
+    // IMEI
+    if (esp_modem_dce_get_imei_number(g_modem_dce_handle, (void*)sizeof(buffer), buffer) == ESP_OK) {
+        be_pushstring(vm, buffer);
     } else {
-        ESP_LOGW(TAG, "Failed to get IMEI number. DCE handle: %p", g_modem_dce_handle);
+        ESP_LOGW(TAG, "Failed to get IMEI via DCE function.");
+        // Fallback to AT+GSN or AT+CGSN? Most modules support one.
+        // For now, push N/A if DCE function fails.
         be_pushstring(vm, "N/A");
     }
     be_setmember(vm, -2, "imei");
 
-    // IMSI - don't return early if this fails
-    char imsi_buf[32] = {0}; // Increased buffer size for safety
-    if (g_modem_dce_handle && esp_modem_dce_get_imsi_number(g_modem_dce_handle, (void*)sizeof(imsi_buf), imsi_buf) == ESP_OK) {
-        be_pushstring(vm, imsi_buf);
+    // IMSI
+    if (esp_modem_dce_get_imsi_number(g_modem_dce_handle, (void*)sizeof(buffer), buffer) == ESP_OK) {
+        be_pushstring(vm, buffer);
     } else {
-        ESP_LOGW(TAG, "Failed to get IMSI number. DCE handle: %p", g_modem_dce_handle);
+        ESP_LOGW(TAG, "Failed to get IMSI via DCE function.");
         be_pushstring(vm, "N/A");
     }
     be_setmember(vm, -2, "imsi");
+
+    // MSISDN (AT+CNUM)
+    at_cmd_handler_ctx_t cnum_ctx;
+    memset(&cnum_ctx, 0, sizeof(at_cmd_handler_ctx_t));
+    char cnum_cmd[] = "AT+CNUM\r";
+    err = esp_modem_dce_generic_command(g_modem_dce_handle, cnum_cmd, CONFIG_MODEM_COMMAND_TIMEOUT_OPERATOR, at_cmd_response_handler, &cnum_ctx);
+    if (err == ESP_OK && cnum_ctx.command_status == ESP_OK && cnum_ctx.response_buffer) {
+        // Expected: +CNUM: ["<alpha>"],"<number>",<type>[,...]
+        char *num_start = strstr(cnum_ctx.response_buffer, "\",\""); // Look for <empty_alpha>,"number"
+        if (num_start) {
+            num_start += 3; // Skip past ","
+            char *num_end = strchr(num_start, '\"');
+            if (num_end) {
+                *num_end = '\0';
+                be_pushstring(vm, num_start);
+            } else { be_pushstring(vm, ""); ESP_LOGW(TAG, "Could not parse CNUM number end quote"); }
+        } else {
+             // Try looking for format: +CNUM: <alpha>,<number>,<type>
+            num_start = strstr(cnum_ctx.response_buffer, "+CNUM:");
+            if (num_start) {
+                num_start += strlen("+CNUM:");
+                while(*num_start && *num_start == ' ') num_start++; // skip spaces
+                char *alpha_end = strchr(num_start, ',');
+                if (alpha_end) {
+                    num_start = alpha_end + 1;
+                    char *number_end = strchr(num_start, ',');
+                    if (number_end) {
+                        *number_end = '\0';
+                        // Remove quotes if any around the number itself
+                        char *s = num_start, *d = num_start;
+                        while(*s) {
+                            if (*s != '\"') *d++ = *s;
+                            s++;
+                        }
+                        *d = '\0';
+                        be_pushstring(vm, num_start);
+                    } else { be_pushstring(vm, ""); ESP_LOGW(TAG, "Could not parse CNUM number end comma"); }
+                } else { be_pushstring(vm, ""); ESP_LOGW(TAG, "Could not parse CNUM alpha end comma"); }
+            } else { be_pushstring(vm, ""); ESP_LOGW(TAG, "CNUM response format not recognized"); }
+        }
+        free(cnum_ctx.response_buffer);
+    } else {
+        ESP_LOGW(TAG, "AT+CNUM failed. IDF err: %s, Modem status: %s", esp_err_to_name(err), esp_err_to_name(cnum_ctx.command_status));
+        if(cnum_ctx.response_buffer) free(cnum_ctx.response_buffer);
+        be_pushstring(vm, "");
+    }
+    be_setmember(vm, -2, "msisdn");
+
+    // ICCID (AT+CCID)
+    at_cmd_handler_ctx_t ccid_ctx;
+    memset(&ccid_ctx, 0, sizeof(at_cmd_handler_ctx_t));
+    char ccid_cmd[] = "AT+CCID\r";
+    err = esp_modem_dce_generic_command(g_modem_dce_handle, ccid_cmd, CONFIG_MODEM_COMMAND_TIMEOUT_DEFAULT, at_cmd_response_handler, &ccid_ctx);
+    if (err == ESP_OK && ccid_ctx.command_status == ESP_OK && ccid_ctx.response_buffer) {
+        // Expected: +CCID: <iccid_val>  or just <iccid_val>
+        char *iccid_val = ccid_ctx.response_buffer;
+        if (strstr(iccid_val, "+CCID:")) {
+            iccid_val = strstr(iccid_val, "+CCID:") + strlen("+CCID:");
+            while (*iccid_val == ' ' || *iccid_val == '\t') iccid_val++; // Skip whitespace
+        }
+        // Remove trailing newlines/CRs that at_cmd_response_handler might have added
+        size_t len = strlen(iccid_val);
+        while (len > 0 && (iccid_val[len-1] == '\n' || iccid_val[len-1] == '\r')) {
+            iccid_val[--len] = '\0';
+        }
+        // Remove OK if it's on the same line (some modems do this for CCID)
+        char *ok_ptr = strstr(iccid_val, "OK");
+        if (ok_ptr) { 
+            // check if OK is preceded by only whitespace
+            char *check_ptr = ok_ptr -1;
+            while (check_ptr >= iccid_val && (*check_ptr == ' ' || *check_ptr == '\t')) {
+                check_ptr--;
+            }
+            if (check_ptr < iccid_val || *check_ptr == '\n' || *check_ptr == '\r') { // OK is on its own line or start
+                 // This case is handled by at_cmd_response_handler which should strip OK
+            } else { // OK is appended to the CCID value, strip it
+                *ok_ptr = '\0'; 
+                len = strlen(iccid_val);
+                while (len > 0 && (iccid_val[len-1] == ' ' || iccid_val[len-1] == '\t')) { // Trim trailing space before OK
+                     iccid_val[--len] = '\0';
+                }
+            }
+        }
+        be_pushstring(vm, iccid_val);
+        free(ccid_ctx.response_buffer);
+    } else {
+        ESP_LOGW(TAG, "AT+CCID failed. IDF err: %s, Modem status: %s", esp_err_to_name(err), esp_err_to_name(ccid_ctx.command_status));
+        if(ccid_ctx.response_buffer) free(ccid_ctx.response_buffer);
+        be_pushstring(vm, "");
+    }
+    be_setmember(vm, -2, "iccid");
+
+    // Operator Name
+    err = modem_board_get_operator_state(buffer, sizeof(buffer));
+    if (err == ESP_OK) {
+        be_pushstring(vm, buffer);
+    } else {
+        ESP_LOGW(TAG, "Failed to get operator name: %s", esp_err_to_name(err));
+        be_pushstring(vm, "");
+    }
+    be_setmember(vm, -2, "operator");
+
+    // SIM Card State
+    int sim_ready_int = 0; 
+    err = modem_board_get_sim_cart_state(&sim_ready_int);
+    if (err == ESP_OK) {
+        be_pushbool(vm, (bool)sim_ready_int);
+    } else {
+        ESP_LOGW(TAG, "Failed to get SIM card state: %s", esp_err_to_name(err));
+        be_pushbool(vm, false);
+    }
+    be_setmember(vm, -2, "sim_ready");
     
-    // IP Address
-    be_pushstring(vm, ip_str_buf); be_setmember(vm, -2, "ip");
-    
-    // Add debug information to the status map
+    // DCE Handle Valid
     be_pushbool(vm, g_modem_dce_handle != NULL);
     be_setmember(vm, -2, "dce_handle_valid");
 
-    // The 'at_ok' variable was reflecting the status of the last command in this function (modem_board_get_operator_state)
-    // This might not be a reliable indicator of general AT command health.
-    // The AT check in init is a better place. We can remove this or make it more robust.
-    // For now, keep it as is, but be aware of its original context.
-    bool at_ok = (err == ESP_OK);
-    be_pushbool(vm, at_ok);
-    be_setmember(vm, -2, "at_ok");
-    
-    // Remove return value of be_pop, not used
-    be_pop(vm, be_top(vm) - 1 -1); // Leave the map object on top
-    be_return(vm);
+    // Modem Type (as configured in Berry lib)
+    const char* type_str = "UNKNOWN";
+    switch (g_modem_type) {
+        case MODEM_TYPE_SIM7600: type_str = "SIM7600"; break;
+        case MODEM_TYPE_SIM800:  type_str = "SIM800"; break;
+        case MODEM_TYPE_BG96:    type_str = "BG96"; break;
+        case MODEM_TYPE_GENERIC: type_str = "GENERIC"; break;
+    }
+    be_pushstring(vm, type_str);
+    be_setmember(vm, -2, "modem_type");
+
+    be_return(vm); // Return the map
 }
 
 // Set the modem module type (runtime configuration)
@@ -515,19 +654,7 @@ static int w_modem_get_type(bvm *vm) {
         case MODEM_TYPE_GENERIC: type_str = "GENERIC"; break;
     }
     be_pushstring(vm, type_str);
-    be_return(vm);
-}
-
-
-// --- Placeholder / To Be Implemented with AT command sending via new driver ---
-// For now, these will just check if the modem is initialized.
-static int w_modem_get_gnss_info(bvm *vm) {
-    if (g_modem_dce_handle == NULL) {
-        be_raise(vm, "runtime_error", "Modem not initialized.");
-        be_return(vm);
-    }
-    ESP_LOGW(TAG, "GNSS info not yet implemented.");
-    be_raise(vm, "runtime_error", "GNSS not implemented");
+    // Corrected return statement for w_modem_get_type
     be_return(vm);
 }
 
@@ -689,71 +816,6 @@ static int w_modem_send_sms(bvm *vm) {
     }
 }
 
-static int w_modem_get_msisdn(bvm *vm) {
-    if (g_modem_dce_handle == NULL) {
-        be_raise(vm, "runtime_error", "Modem not initialized.");
-        be_return(vm);
-    }
-    ESP_LOGW(TAG, "MSISDN retrieval not yet implemented.");
-    be_pushstring(vm, ""); // Return empty string
-    be_return(vm);
-}
-
-// Berry function to get the next available NMEA sentence
-static int w_modem_get_nmea(bvm *vm) {
-    if (!nmea_data_queue) {
-        // This case should ideally not happen if modem.init() was successful
-        // and initialized the queue.
-        // If init failed, the queue wouldn't exist.
-        // If called before init, this is also an issue.
-        // For robustness, we can raise or return nil.
-        // be_raise(vm, "runtime_error", "NMEA queue not initialized. Call modem.init() first.");
-        // return -1; 
-        be_pushnil(vm); // Return nil if queue doesn't exist
-        return BE_OK;
-    }
-    char *nmea_sentence_ptr = NULL;
-    if (xQueueReceive(nmea_data_queue, &nmea_sentence_ptr, 0) == pdPASS) { // Non-blocking read
-        if (nmea_sentence_ptr) {
-            be_pushstring(vm, nmea_sentence_ptr);
-            free(nmea_sentence_ptr); // Berry VM makes its own copy of the string
-        } else {
-            // This should not happen if only valid, allocated strings are put on the queue
-            ESP_LOGE(TAG, "NMEA queue received a NULL pointer!");
-            be_pushnil(vm);
-        }
-    } else {
-        be_pushnil(vm); // Queue is empty
-    }
-    return BE_OK;
-}
-
-// Public C function to be called by the USB DTE layer (or other NMEA source)
-// This function takes ownership of the string if successfully queued.
-void be_modem_enqueue_nmea_sentence(const char *nmea_sentence_const) {
-    if (!nmea_data_queue) {
-        ESP_LOGW(TAG, "NMEA queue not initialized, cannot enqueue sentence.");
-        return;
-    }
-    if (!nmea_sentence_const) {
-        ESP_LOGW(TAG, "Attempted to enqueue NULL NMEA sentence.");
-        return;
-    }
-
-    // Make a copy to put on the queue, as the original buffer might be reused by the caller
-    char *nmea_copy = strdup(nmea_sentence_const);
-    if (nmea_copy) {
-        if (xQueueSend(nmea_data_queue, &nmea_copy, 0) != pdPASS) { // Non-blocking send, 0 ticks timeout
-            ESP_LOGW(TAG, "NMEA queue full, sentence dropped: %s", nmea_copy);
-            free(nmea_copy); // Free the copy if not enqueued
-        } else {
-            // ESP_LOGD(TAG, "Enqueued NMEA: %s", nmea_copy); // Can be verbose
-        }
-    } else {
-        ESP_LOGE(TAG, "Failed to strdup NMEA sentence for queue: %s", nmea_sentence_const);
-    }
-}
-
 // Function to send an arbitrary AT command
 static int w_modem_at_command(bvm *vm) {
     if (g_modem_dce_handle == NULL) {
@@ -855,28 +917,19 @@ static int w_modem_at_command(bvm *vm) {
 
 
 /* @const_object_info_begin
-module modem (scope: global, strings: weak) { // Changed module name to 'modem'
+module modem (scope: global, strings: weak) {
     start, func(w_modem_init)
     stop, func(w_modem_deinit)
     connect, func(w_modem_connect)
     disconnect, func(w_modem_disconnect)
-    status, func(w_modem_status)
+    status, func(w_modem_status)       // Now focused on dynamic status
+    info, func(w_modem_info)           // New function for static info
     
-    // Placeholders, to be re-implemented if AT command sending is available
-    gnss, func(w_modem_get_gnss_info)
-    set_type, func(w_modem_set_type) // May be useful for constructing AT commands
-    get_type, func(w_modem_get_type) // May be useful for constructing AT commands
-    msisdn, func(w_modem_get_msisdn)
+    set_type, func(w_modem_set_type)
+    get_type, func(w_modem_get_type)
     send_sms, func(w_modem_send_sms)
 
-    // New function for arbitrary AT commands
     at_command, func(w_modem_at_command)
-
-    // New function to get NMEA data
-    get_nmea, func(w_modem_get_nmea)
-
-    // Removed: init_uart, init_usb, set_power_pin, set_reset_pin, power_on, power_off, reset
-    // Callbacks on_connect/on_disconnect might be replaced by a generic on_event
 }
 @const_object_info_end */
 
